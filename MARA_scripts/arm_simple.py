@@ -4,6 +4,7 @@
 # is subject to the terms and conditions of the Boston Dynamics Software
 # Development Kit License (20191101-BDSDK-SL).
 #test
+import numpy
 
 """Tutorial to show how to use Spot's arm.
 """
