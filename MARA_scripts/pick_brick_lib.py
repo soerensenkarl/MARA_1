@@ -190,25 +190,36 @@ def run(
     robot.logger.info("Finished grasp: %s", "SUCCESS" if success else "FAILED")
 
         # ---- NEW: Stow arm while keeping grasp closed ----
+     # ---- Move to carry (lift) while keeping grip, then stow ----
+     
     if success and stow_after_grasp:
         cmd_client = robot.ensure_client(RobotCommandClient.default_service_name)
 
-        # Keep the gripper closed (0.0 = fully closed) while stowing the arm.
+        # Keep the gripper closed (0.0 = fully closed).
         grip_closed = RobotCommandBuilder.claw_gripper_open_fraction_command(0.0)
-        stow_cmd   = RobotCommandBuilder.arm_stow_command()
 
-        # Build a single synchronized command so both run together.
-        synchro = RobotCommandBuilder.build_synchro_command(grip_closed, stow_cmd)
+        # 1) Lift to a safe transport pose.
+        carry_cmd = RobotCommandBuilder.arm_carry_command()
+        carry_syn = RobotCommandBuilder.build_synchro_command(grip_closed, carry_cmd)
+
+        robot.logger.info("Moving arm to CARRY pose while maintaining grasp…")
+        carry_id = cmd_client.robot_command(carry_syn)
+        try:
+            block_until_arm_arrives(cmd_client, carry_id, timeout_sec=15.0)
+            robot.logger.info("Arm in CARRY pose.")
+        except Exception as e:
+            robot.logger.warning(f"Carry wait failed (continuing to stow anyway): {e}")
+
+        # 2) Now stow (still keep gripper closed).
+        stow_cmd = RobotCommandBuilder.arm_stow_command()
+        stow_syn = RobotCommandBuilder.build_synchro_command(grip_closed, stow_cmd)
 
         robot.logger.info("Stowing arm while maintaining grasp…")
-        cmd_id = cmd_client.robot_command(synchro)
-
-        # Block until the arm reports it has reached the stow position.
+        stow_id = cmd_client.robot_command(stow_syn)
         try:
-            block_until_arm_arrives(cmd_client, cmd_id, timeout_sec=15.0)
+            block_until_arm_arrives(cmd_client, stow_id, timeout_sec=20.0)
             robot.logger.info("Arm stowed.")
         except Exception as e:
-            robot.logger.warning(f"Arm stow wait failed (continuing): {e}")
+            robot.logger.warning(f"Stow wait failed: {e}")
 
-            
     return success
