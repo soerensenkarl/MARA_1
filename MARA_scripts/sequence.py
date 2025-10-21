@@ -57,20 +57,20 @@ def main():
 
         pick_ok = pick.run(
             robot,
-            image_source="hand_color_image",
+            image_source="frontleft_fisheye_image",
             force_top_down_grasp=True,
             click_ui=True,            # show window, click to pick
             pixel_xy=None,            # or set a pixel programmatically
         )
         assert pick_ok, "Pick (hand camera) failed."
 
-        # robot.logger.info("Starting Autowalk…")
-        # walk_ok = walk.play(robot)
-        # assert walk_ok, "Autowalk failed."
+        robot.logger.info("Starting Autowalk…")
+        walk_ok = walk.play(robot)
+        assert walk_ok, "Autowalk failed."
 
 
-        # arm_simple.run(robot, seconds=2.0)
-        # arm_simple.run(robot, seconds=2.0)
+        arm_simple.run(robot, seconds=2.0)
+        arm_simple.run(robot, seconds=2.0)
         # arm_simple.run(robot, seconds=2.0)
 
         # ---- Finish: safe sit + power off ----

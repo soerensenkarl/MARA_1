@@ -12,6 +12,13 @@ from bosdyn.client.manipulation_api_client import ManipulationApiClient
 from bosdyn.client.robot_command import RobotCommandClient
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.frame_helpers import VISION_FRAME_NAME, get_vision_tform_body, math_helpers
+from bosdyn.client.estop import EstopClient
+from bosdyn.api import estop_pb2
+from bosdyn.client.robot_command import (
+    RobotCommandClient,
+    RobotCommandBuilder,
+    block_until_arm_arrives,
+)
 
 # ---- UI globals (reused from the tutorial) ----
 g_image_click = None
@@ -32,12 +39,19 @@ def cv_mouse_callback(event, x, y, flags, param):
         cv2.imshow(image_title, clone)
 
 def _verify_not_estopped(robot):
-    client = robot.ensure_client(EstopClient.default_service_name)
-    status = client.get_status()
-    if status.stop_level != status.ESTOP_LEVEL_NONE:
-        msg = ("Robot is E-Stopped. Configure/Release external E-Stop before grasp.")
-        robot.logger.error(msg)
-        raise RuntimeError(msg)
+    """Check that Spot is not currently estopped."""
+    estop_client = robot.ensure_client(EstopClient.default_service_name)
+    status = estop_client.get_status()
+
+    # Compare against the enum in estop_pb2, not the status object itself
+    if status.stop_level != estop_pb2.ESTOP_LEVEL_NONE:
+        level_name = estop_pb2.EstopStopLevel.Name(status.stop_level)
+        endpoints = [e.endpoint_name for e in status.endpoints]
+        raise RuntimeError(
+            f"Robot is estopped: stop_level={level_name}. "
+            f"Active endpoints: {', '.join(endpoints) or 'none'}.\n"
+            "Make sure your E-Stop is registered and in HOLD/RUNNING, then try again."
+        )
 
 def _add_grasp_constraint(opts, grasp, robot_state_client):
     use_vector = opts.get("force_top_down_grasp") or opts.get("force_horizontal_grasp")
@@ -94,6 +108,7 @@ def run(
     click_ui: bool = True,
     pixel_xy: tuple[int, int] | None = None,
     feedback_poll_s: float = 0.25,
+    stow_after_grasp: bool = True, 
 ) -> bool:
     """Pick an object by image click or provided pixel on an already-authenticated, standing robot.
 
@@ -173,4 +188,27 @@ def run(
 
     success = fb.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED
     robot.logger.info("Finished grasp: %s", "SUCCESS" if success else "FAILED")
+
+        # ---- NEW: Stow arm while keeping grasp closed ----
+    if success and stow_after_grasp:
+        cmd_client = robot.ensure_client(RobotCommandClient.default_service_name)
+
+        # Keep the gripper closed (0.0 = fully closed) while stowing the arm.
+        grip_closed = RobotCommandBuilder.claw_gripper_open_fraction_command(0.0)
+        stow_cmd   = RobotCommandBuilder.arm_stow_command()
+
+        # Build a single synchronized command so both run together.
+        synchro = RobotCommandBuilder.build_synchro_command(grip_closed, stow_cmd)
+
+        robot.logger.info("Stowing arm while maintaining grasp…")
+        cmd_id = cmd_client.robot_command(synchro)
+
+        # Block until the arm reports it has reached the stow position.
+        try:
+            block_until_arm_arrives(cmd_client, cmd_id, timeout_sec=15.0)
+            robot.logger.info("Arm stowed.")
+        except Exception as e:
+            robot.logger.warning(f"Arm stow wait failed (continuing): {e}")
+
+            
     return success
