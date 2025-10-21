@@ -1,12 +1,15 @@
 # sequence.py
 import time
-from pathlib import Path  # ← ADD THIS LINE
+from pathlib import Path
 
 import bosdyn.client
 import bosdyn.client.util
+import bosdyn.mission.client
 from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
 from bosdyn.client.robot_command import RobotCommandClient, blocking_stand
 import arm_simple
+import walk_action as walk
+import pick_brick_lib as pick
 
 # ---- Set once here (or swap to env vars) ----
 HOST = "192.168.80.3"
@@ -26,7 +29,11 @@ def load_credentials(path: Path):
 def main():
     USER, PASS = load_credentials(CRED_PATH)
     
-    sdk = bosdyn.client.create_standard_sdk("MARA_Sequence")
+    sdk = bosdyn.client.create_standard_sdk(
+    "MARA_Sequence",
+    [bosdyn.mission.client.MissionClient]  # ← register Mission service like in Mission Replay example
+    )
+
     robot = sdk.create_robot(HOST)
     robot.authenticate(USER, PASS)
     robot.time_sync.wait_for_sync()
@@ -43,14 +50,28 @@ def main():
 
         cmd_client = robot.ensure_client(RobotCommandClient.default_service_name)
         robot.logger.info("Standing…")
-        blocking_stand(cmd_client, timeout_sec=10)
+        blocking_stand(cmd_client, timeout_sec=20)
+
 
         # ---- Call actions (they assume standing & ready) ----
-        robot.logger.info("Action 1: arm_simple")
-        arm_simple.run(robot, seconds=2.0)
 
-        robot.logger.info("Action 2: arm_simple (again)")
-        arm_simple.run(robot, seconds=2.0)
+        pick_ok = pick.run(
+            robot,
+            image_source="hand_color_image",
+            force_top_down_grasp=True,
+            click_ui=True,            # show window, click to pick
+            pixel_xy=None,            # or set a pixel programmatically
+        )
+        assert pick_ok, "Pick (hand camera) failed."
+
+        # robot.logger.info("Starting Autowalk…")
+        # walk_ok = walk.play(robot)
+        # assert walk_ok, "Autowalk failed."
+
+
+        # arm_simple.run(robot, seconds=2.0)
+        # arm_simple.run(robot, seconds=2.0)
+        # arm_simple.run(robot, seconds=2.0)
 
         # ---- Finish: safe sit + power off ----
         robot.logger.info("Sequence complete. Powering off (safe sit)…")
