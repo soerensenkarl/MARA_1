@@ -45,7 +45,7 @@ SEND_IN_ODOM = False    # command frame (False = vision)
 # Define a simple chain of relative offsets (meters)
 STEPS: List[Tuple[float, float, float]] = [
     (0.00, 0.00, 0.50),  # move 10 cm up
-    (0.00, 0.00, 0.70), # move 10 cm left
+    (0.00, 0.00, 0.50), # move 10 cm left
     (0.00, 0.00, 0.20),  # move 10 cm right
 ]
 

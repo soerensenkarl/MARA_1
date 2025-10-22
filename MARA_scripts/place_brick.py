@@ -12,6 +12,8 @@
 
 import time
 from typing import List, Tuple, Optional
+import math
+
 
 from bosdyn.api import arm_command_pb2, world_object_pb2
 from bosdyn.api.spot import robot_command_pb2 as spot_command_pb2
@@ -40,15 +42,22 @@ SEND_IN_ODOM = False       # command frame (False = vision)
 USE_BODY_FOLLOW = True         # if True, command base to follow the hand
 ENABLE_HIP_HEIGHT_ASSIST = True  # if True, allow Spot to lower/adjust base height/yaw to help arm
 
-# Define a simple chain of relative offsets (meters) w.r.t. the fiducial frame
-STEPS: List[Tuple[float, float, float]] = [
-    (0.00, 0.00, 0.50),  # up
-    (0.10, 0.00, 0.50),  # forward a bit
-    (0.00, 0.00, 0.10),  # near ground test — base should lower if needed
+# ---- User configuration ----
+DEFAULT_PITCH_DEG = 90  # “looking down” if a step doesn't specify pitch
+
+# Each step can be (dx, dy, dz) or (dx, dy, dz, pitch_deg)
+STEPS = [
+    (0.00,  0.00, 0.10),            # uses DEFAULT_PITCH_DEG
+    (0.00,  0.20, 0.10),     # custom pitch
+    (0.00, -0.20, 0.10),            # uses DEFAULT_PITCH_DEG
 ]
 
 # ---------------------------------------------------------------------------
 
+def _quat_from_pitch_deg(pitch_deg: float) -> math_helpers.Quat:
+    """Create a quaternion rotated 'pitch_deg' about the Y axis."""
+    # Boston Dynamics helpers include from_pitch(radians)
+    return math_helpers.Quat.from_pitch(math.radians(pitch_deg))
 
 def _mobility_params():
     """Mobility params that assist manipulation (hip height and optional yaw)."""
@@ -113,26 +122,37 @@ def _send_pose(robot, command_client, pose: SE3, frame_name: str, seconds: float
 
 
 def run(robot):
-    """Execute the chained movements relative to the fiducial, with optional body follow."""
     robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
     command_client = robot.ensure_client(RobotCommandClient.default_service_name)
 
-    goal_rot = math_helpers.Quat(w=1, x=0, y=0, z=0)
-    acc = SE3(0, 0, 0, goal_rot)
+    acc = SE3(0, 0, 0, math_helpers.Quat())  # start with identity; rotation handled per-step
 
-    for i, (dx, dy, dz) in enumerate(STEPS, start=1):
+    for i, step in enumerate(STEPS, start=1):
+        # Parse (dx, dy, dz[, pitch_deg])
+        if len(step) == 3:
+            dx, dy, dz = step
+            pitch_deg = DEFAULT_PITCH_DEG
+        elif len(step) == 4:
+            dx, dy, dz, pitch_deg = step
+        else:
+            raise ValueError("Each step must be (dx, dy, dz) or (dx, dy, dz, pitch_deg).")
+
+        # Per-step rotation: “looking down” by default or the provided pitch
+        step_rot = _quat_from_pitch_deg(pitch_deg)
+
         fid_name, vision_T_fid = _find_fiducial(robot, tag_id=TAG_ID)
 
         offset = SE3(
-            acc.x + dx if CUMULATIVE else dx,
-            acc.y + dy if CUMULATIVE else dy,
-            acc.z + dz if CUMULATIVE else dz,
-            goal_rot,
+            (acc.x + dx) if CUMULATIVE else dx,
+            (acc.y + dy) if CUMULATIVE else dy,
+            (acc.z + dz) if CUMULATIVE else dz,
+            step_rot,
         )
         if CUMULATIVE:
-            acc = offset
+            # Accumulate position only; keep rotation controlled per-step (not cumulative).
+            acc = SE3(offset.x, offset.y, offset.z, acc.rot)
 
-        # Compute target in either VISION or ODOM.
+        # Compute target pose in chosen root frame
         if SEND_IN_ODOM:
             rs = robot_state_client.get_robot_state()
             tf = rs.kinematic_state.transforms_snapshot
@@ -148,6 +168,7 @@ def run(robot):
         robot.logger.info(
             f"[{i}/{len(STEPS)}] Move to {fid_name} + "
             f"({offset.x:.3f}, {offset.y:.3f}, {offset.z:.3f}) m in {frame_used} "
+            f"pitch={pitch_deg:.1f}° "
             f"[body_follow={'ON' if USE_BODY_FOLLOW else 'OFF'}, hip_assist={'ON' if ENABLE_HIP_HEIGHT_ASSIST else 'OFF'}]"
         )
 
