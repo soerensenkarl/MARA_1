@@ -68,16 +68,7 @@ def main():
         # walk_ok = walk.play(robot)
         # assert walk_ok, "Autowalk failed."
 
-        place_brick.run(
-            robot,
-            seconds=2.0,
-            tag_id=4,          # your printed tag is "4"
-            target_x=0.00,     # 20 cm to the right of the tag
-            target_y=0.00,
-            target_z=0.10,     # 20 cm above the tag
-            # send_in_odom=False,  # default; set True if you prefer ODOM
-            # do_stow=True,        # optional: stow after move
-        )
+        place_brick.run(robot)
 
         # ---- Finish: safe sit + power off ----
         robot.logger.info("Sequence complete. Powering off (safe sit)…")
