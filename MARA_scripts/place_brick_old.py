@@ -3,18 +3,24 @@
 #
 # SDK License: 20191101-BDSDK-SL
 #
-# place_brick.py — Simple chained arm movements relative to an AprilTag fiducial,
-# with optional body-follow and hip-height assist so Spot can move its base to help the arm.
+# place_brick.py — Simple chained arm movements relative to an AprilTag fiducial.
 #
 # Designed to be called from sequence.py as:
 #     import place_brick
 #     place_brick.run(robot)
+#
+# The script automatically finds fiducial tag_id=4 (change below if needed),
+# and executes a predefined sequence of movements relative to that tag:
+#   1) Move 10 cm above the tag.
+#   2) Move 10 cm to the left.
+#   3) Move 10 cm to the right.
+#
+# You can edit the "STEPS" list to define your own motion chain.
 
 import time
 from typing import List, Tuple, Optional
 
 from bosdyn.api import arm_command_pb2, world_object_pb2
-from bosdyn.api.spot import robot_command_pb2 as spot_command_pb2
 from bosdyn.client import math_helpers
 from bosdyn.client.frame_helpers import VISION_FRAME_NAME, ODOM_FRAME_NAME, get_a_tform_b
 from bosdyn.client.robot_command import (
@@ -31,36 +37,19 @@ SE3 = math_helpers.SE3Pose
 # User configuration
 # ---------------------------------------------------------------------------
 
-TAG_ID = 4                 # AprilTag ID to follow
-SECONDS_PER_STEP = 1.5     # time per move
-CUMULATIVE = False         # if True, steps build on each other
-SEND_IN_ODOM = False       # command frame (False = vision)
+TAG_ID = 4          # ID number of the fiducial (printed tag)
+SECONDS_PER_STEP = 1.5  # time per move
+CUMULATIVE = False      # if True, steps build on each other
+SEND_IN_ODOM = False    # command frame (False = vision)
 
-# Mobility assist / body follow
-USE_BODY_FOLLOW = True         # if True, command base to follow the hand
-ENABLE_HIP_HEIGHT_ASSIST = True  # if True, allow Spot to lower/adjust base height/yaw to help arm
-
-# Define a simple chain of relative offsets (meters) w.r.t. the fiducial frame
+# Define a simple chain of relative offsets (meters)
 STEPS: List[Tuple[float, float, float]] = [
-    (0.00, 0.00, 0.50),  # up
-    (0.10, 0.00, 0.50),  # forward a bit
-    (0.00, 0.00, 0.10),  # near ground test — base should lower if needed
+    (0.00, 0.00, 0.50),  # move 10 cm up
+    (0.00, 0.00, 0.70), # move 10 cm left
+    (0.00, 0.00, 0.20),  # move 10 cm right
 ]
 
 # ---------------------------------------------------------------------------
-
-
-def _mobility_params():
-    """Mobility params that assist manipulation (hip height and optional yaw)."""
-    body_assist = spot_command_pb2.BodyControlParams.BodyAssistForManipulation(
-        enable_hip_height_assist=ENABLE_HIP_HEIGHT_ASSIST,
-        enable_body_yaw_assist=False,
-    )
-    return spot_command_pb2.MobilityParams(
-        body_control=spot_command_pb2.BodyControlParams(
-            body_assist_for_manipulation=body_assist
-        )
-    )
 
 
 def _find_fiducial(robot, tag_id: Optional[int], wait_sec: float = 3.0):
@@ -72,6 +61,7 @@ def _find_fiducial(robot, tag_id: Optional[int], wait_sec: float = 3.0):
     while True:
         resp = wo_client.list_world_objects(object_type=[world_object_pb2.WORLD_OBJECT_APRILTAG])
         objs = resp.world_objects
+
         chosen = next((o for o in objs if o.apriltag_properties.tag_id == tag_id), None)
         if chosen or (time.time() - t0) > wait_sec:
             break
@@ -87,33 +77,20 @@ def _find_fiducial(robot, tag_id: Optional[int], wait_sec: float = 3.0):
     return fid_frame, vision_T_fid
 
 
-def _send_pose(robot, command_client, pose: SE3, frame_name: str, seconds: float):
-    """Send a single arm pose, optionally with body-follow + mobility assist, and block until done."""
-    # Arm pose.
+def _send_pose(command_client, pose: SE3, frame_name: str, seconds: float):
+    """Send a single arm pose command and block until complete."""
     arm_cmd = RobotCommandBuilder.arm_pose_command(
         pose.x, pose.y, pose.z,
         pose.rot.w, pose.rot.x, pose.rot.y, pose.rot.z,
         frame_name, seconds
     )
-
-    # Stand with mobility params so Spot can lower/adjust to help the arm.
-    stand_cmd = RobotCommandBuilder.synchro_stand_command(params=_mobility_params())
-
-    # Optionally tell the base to follow the hand.
-    if USE_BODY_FOLLOW:
-        follow_cmd = RobotCommandBuilder.follow_arm_command()
-        # Just pass commands positionally—no build_on_command kwarg.
-        command = RobotCommandBuilder.build_synchro_command(follow_cmd, arm_cmd, stand_cmd)
-    else:
-        command = RobotCommandBuilder.build_synchro_command(stand_cmd, arm_cmd)
-
-    cmd_id = command_client.robot_command(command)
+    cmd = RobotCommandBuilder.build_synchro_command(arm_cmd)
+    cmd_id = command_client.robot_command(cmd)
     block_until_arm_arrives(command_client, cmd_id)
 
 
-
 def run(robot):
-    """Execute the chained movements relative to the fiducial, with optional body follow."""
+    """Execute the chained movements relative to the fiducial."""
     robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
     command_client = robot.ensure_client(RobotCommandClient.default_service_name)
 
@@ -122,7 +99,6 @@ def run(robot):
 
     for i, (dx, dy, dz) in enumerate(STEPS, start=1):
         fid_name, vision_T_fid = _find_fiducial(robot, tag_id=TAG_ID)
-
         offset = SE3(
             acc.x + dx if CUMULATIVE else dx,
             acc.y + dy if CUMULATIVE else dy,
@@ -132,7 +108,6 @@ def run(robot):
         if CUMULATIVE:
             acc = offset
 
-        # Compute target in either VISION or ODOM.
         if SEND_IN_ODOM:
             rs = robot_state_client.get_robot_state()
             tf = rs.kinematic_state.transforms_snapshot
@@ -147,16 +122,14 @@ def run(robot):
 
         robot.logger.info(
             f"[{i}/{len(STEPS)}] Move to {fid_name} + "
-            f"({offset.x:.3f}, {offset.y:.3f}, {offset.z:.3f}) m in {frame_used} "
-            f"[body_follow={'ON' if USE_BODY_FOLLOW else 'OFF'}, hip_assist={'ON' if ENABLE_HIP_HEIGHT_ASSIST else 'OFF'}]"
+            f"({offset.x:.3f}, {offset.y:.3f}, {offset.z:.3f}) m in {frame_used}"
         )
-
-        _send_pose(robot, command_client, target_pose, frame_used, SECONDS_PER_STEP)
+        _send_pose(command_client, target_pose, frame_used, SECONDS_PER_STEP)
 
     robot.logger.info("place_brick.run() chain complete.")
 
 
-# Optional back-compat helper (unchanged)
+# Optional back-compat helper (not used but kept for clarity)
 def _block_until_cartesian_done(robot, command_client, cmd_id):
     while True:
         fb = command_client.robot_command_feedback(cmd_id)

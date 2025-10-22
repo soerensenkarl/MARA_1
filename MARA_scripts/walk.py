@@ -5,21 +5,23 @@
 # Development Kit License (20191101-BDSDK-SL).
 
 """
-Mission Replay Script.  Command-line utility to replay stored missions, including Autowalk missions.
+Autowalk replay as a callable function for use from sequence.py.
+
+Minimal changes:
+- Removed CLI, SDK init, power-on, and stand commands (sequence.py handles those).
+- Exposes run(...) which uploads/localizes (optional) and plays an Autowalk mission
+  using the existing authenticated, time-synced, powered-on, standing robot and an
+  active LeaseKeepAlive managed by sequence.py.
 """
 
-import argparse
+
+
 import os
-import sys
 import time
 
-import google.protobuf.wrappers_pb2
-
 import bosdyn.api.mission
-import bosdyn.api.power_pb2 as PowerServiceProto
 import bosdyn.client
 import bosdyn.client.lease
-import bosdyn.client.util
 import bosdyn.geometry
 import bosdyn.mission.client
 import bosdyn.util
@@ -28,173 +30,100 @@ from bosdyn.api.autowalk import walks_pb2
 from bosdyn.api.graph_nav import graph_nav_pb2, map_pb2, nav_pb2
 from bosdyn.api.mission import mission_pb2, nodes_pb2
 from bosdyn.client.autowalk import AutowalkResponseError
-from bosdyn.client.power import PowerClient, power_on_motors, safe_power_off_motors
-from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient, blocking_stand
+from bosdyn.client.robot_command import RobotCommandClient
 from bosdyn.client.robot_state import RobotStateClient
 
+# Default autowalk config (you can override via env vars or function args)
+WALK_DIR = os.environ.get("WALK_DIR", r"C:\MARA_1\MARA_scripts\walk.walk")  # change this if needed
+WALK_FILE = os.environ.get("WALK_FILE", "walk.walk")  # change this if needed
 
-def main():
-    """Replay stored mission"""
+# Default runtime options
+WALK_DEFAULTS = {
+    "upload_timeout": 300.0,
+    "mission_timeout": 3.0,
+    "noloc": False,
+    "disable_alternate_route_finding": False,
+    "disable_directed_exploration": False,
+    "strict_mode": False,
+    "duration": 0.0,   # 0.0 = run once
+    "static_mode": False,
+}
 
-    body_lease = None
 
-    # Configure logging
-    bosdyn.client.util.setup_logging()
 
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser()
+# -------------------------
+# Public entry point
+# -------------------------
+def run(
+    robot,
+    walk_directory: str,
+    walk_filename: str,
+    *,
+    upload_timeout: float = 300.0,
+    mission_timeout: float = 3.0,
+    noloc: bool = False,
+    disable_alternate_route_finding: bool = False,
+    disable_directed_exploration: bool = False,
+    strict_mode: bool = False,
+    duration: float = 0.0,
+    static_mode: bool = False,
+) -> bool:
+    """Replay an Autowalk mission using an already-authenticated, powered-on, standing robot.
 
-    bosdyn.client.util.add_base_arguments(parser)
-
-    parser.add_argument('--upload_timeout', type=float, default=300.0, dest='upload_timeout',
-                        help='Mission upload timeout.')
-    parser.add_argument('--mission_timeout', type=float, default=3.0, dest='mission_timeout',
-                        help='Mission client timeout.')
-    parser.add_argument('--noloc', action='store_true', default=False, dest='noloc',
-                        help='Skip initial localization')
-    parser.add_argument('--disable_alternate_route_finding', action='store_true', default=False,
-                        dest='disable_alternate_route_finding',
-                        help='Disable creating alternate-route-finding graph structure')
-    parser.add_argument('--disable_directed_exploration', action='store_true', default=False,
-                        dest='disable_directed_exploration',
-                        help='Disable directed exploration for skipped blocked branches')
-    parser.add_argument('--strict_mode', action='store_true', default=False, dest='strict_mode',
-                        help='Set strict path following mode')
-
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument('--time', type=float, default=0.0, dest='duration',
-                       help='Time to repeat mission (sec)')
-    group.add_argument('--static', action='store_true', default=False, dest='static_mode',
-                       help='Stand, but do not run robot')
-
-    # Subparser for mission type
-    subparsers = parser.add_subparsers(dest='mission_type', help='Mission type')
-    subparsers.required = True
-
-    # Subparser for simple mission
-    simple_parser = subparsers.add_parser('simple', help='Simple mission (non-Autowalk)')
-    simple_parser.add_argument('simple_mission_file', help='Mission file for non-Autowalk mission.')
-
-    # Subparser for Autowalk mission
-    autowalk_parser = subparsers.add_parser('autowalk', help='Autowalk mission using graph_nav')
-    autowalk_parser.add_argument('--walk_directory', dest='walk_directory', required=True,
-                                 help='Directory containing graph_nav map and autowalk missions')
-    autowalk_parser.add_argument(
-        '--walk_filename', dest='walk_filename', required=True, help=
-        'Autowalk mission filename. Script assumes the path to this file is [walk_directory]/missions/[walk_filename]'
-    )
-
-    args = parser.parse_args()
-
+    Preconditions handled by sequence.py:
+      - robot is authenticated & time-synced
+      - a LeaseKeepAlive is active
+      - robot is powered on and standing
+    """
     path_following_mode = map_pb2.Edge.Annotations.PATH_MODE_UNKNOWN
-
-    # In strict mode, disable alternate waypoints and directed exploration
-    if args.strict_mode:
-        args.disable_alternate_route_finding = True
-        args.disable_directed_exploration = True
+    if strict_mode:
+        disable_alternate_route_finding = True
+        disable_directed_exploration = True
         path_following_mode = map_pb2.Edge.Annotations.PATH_MODE_STRICT
         print('[ STRICT MODE ENABLED: Alternate waypoints and directed exploration disabled ]')
 
-    if args.mission_type == 'simple':
-        do_map_load = False
-        fail_on_question = False
-        do_localization = False
-        mission_file = args.simple_mission_file
-        walk_directory = None
-        print(f'[ REPLAYING SIMPLE MISSION {mission_file} : HOSTNAME {args.hostname} ]')
-    else:
-        do_map_load = True
-        fail_on_question = True
-        if args.noloc:
-            do_localization = False
-        else:
-            do_localization = True
-        walk_directory = args.walk_directory
-        mission_file = f'{walk_directory}/missions/{args.walk_filename}'
-
-        print(
-            f'[ REPLAYING AUTOWALK MISSION {mission_file} : WALK DIRECTORY {walk_directory} : HOSTNAME {args.hostname} ]'
-        )
-
-    # Initialize robot object
-    robot = init_robot(args.hostname)
-    if robot.is_estopped():
-        robot.logger.fatal(
-            'Robot is estopped. Please use an external E-Stop client, such as the estop SDK example, to configure E-Stop.'
-        )
-        sys.exit(1)
-
-    # Check if mission_file exists.
+    mission_file = f'{walk_directory}/missions/{walk_filename}'
     if not os.path.isfile(mission_file):
         robot.logger.fatal(f'Unable to find mission file: {mission_file}.')
-        sys.exit(1)
+        return False
 
-    # Acquire robot lease
-    robot.logger.info('Acquiring lease...')
+    # Use existing lease context from sequence.py — just get the client.
     lease_client = robot.ensure_client(bosdyn.client.lease.LeaseClient.default_service_name)
-    with bosdyn.client.lease.LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True):
-        # Initialize power client
-        robot.logger.info('Starting power client...')
-        power_client = robot.ensure_client(PowerClient.default_service_name)
 
-        # Initialize other clients
-        robot_state_client, command_client, mission_client, graph_nav_client = init_clients(
-            robot, mission_file, walk_directory, do_map_load, args.disable_alternate_route_finding,
-            args.upload_timeout)
+    # Init clients + upload graph/mission (no power/stand here)
+    robot_state_client, command_client, mission_client, graph_nav_client = init_clients(
+        robot, mission_file, walk_directory, True,  # do_map_load=True for Autowalk
+        disable_alternate_route_finding, upload_timeout)
 
-        # Turn on power
-        power_on_motors(power_client)
-
-        # Stand up and wait for the perception system to stabilize
-        robot.logger.info('Commanding robot to stand...')
-        blocking_stand(command_client, timeout_sec=20)
-        countdown(5)
-        robot.logger.info('Robot standing.')
-
-        # Localize robot
-        localization_error = False
-        if do_localization:
-            graph = graph_nav_client.download_graph(timeout=args.upload_timeout)
+    # Optional localization (skip if noloc=True)
+    if not noloc:
+        try:
+            _ = graph_nav_client.download_graph(timeout=upload_timeout)
             robot.logger.info('Localizing robot...')
-            robot_state = robot_state_client.get_robot_state()
             localization = nav_pb2.Localization()
-
-            # Attempt to localize using any visible fiducial
             graph_nav_client.set_localization(
-                initial_guess_localization=localization, ko_tform_body=None, max_distance=None,
-                max_yaw=None,
+                initial_guess_localization=localization,
+                ko_tform_body=None, max_distance=None, max_yaw=None,
                 fiducial_init=graph_nav_pb2.SetLocalizationRequest.FIDUCIAL_INIT_NEAREST)
+        except Exception as e:
+            robot.logger.warning(f'Localization attempt failed: {e}')
 
-        # Run mission
-        if not args.static_mode and not localization_error:
-            if args.duration == 0.0:
-                run_mission(robot, mission_client, lease_client, fail_on_question,
-                            args.mission_timeout, args.disable_directed_exploration,
-                            path_following_mode)
-            else:
-                repeat_mission(robot, mission_client, lease_client, args.duration, fail_on_question,
-                               args.mission_timeout, args.disable_directed_exploration,
-                               path_following_mode)
+    # Run once or repeat for duration (static_mode = do nothing)
+    if static_mode:
+        robot.logger.info('Static mode requested; not starting mission.')
+        return True
 
-
-def init_robot(hostname):
-    """Initialize robot object"""
-
-    # Initialize SDK
-    sdk = bosdyn.client.create_standard_sdk('MissionReplay', [bosdyn.mission.client.MissionClient])
-
-    # Create robot object
-    robot = sdk.create_robot(hostname)
-
-    # Authenticate with robot
-    bosdyn.client.util.authenticate(robot)
-
-    # Establish time sync with the robot
-    robot.time_sync.wait_for_sync()
-
-    return robot
+    if duration == 0.0:
+        return run_mission(robot, mission_client, lease_client, True,  # fail_on_question
+                           mission_timeout, disable_directed_exploration, path_following_mode)
+    else:
+        return repeat_mission(robot, mission_client, lease_client, duration, True,
+                              mission_timeout, disable_directed_exploration, path_following_mode)
 
 
+# -------------------------
+# Helpers (unchanged logic)
+# -------------------------
 def init_clients(robot, mission_file, walk_directory, do_map_load, disable_alternate_route_finding,
                  upload_timeout):
     """Initialize clients"""
@@ -211,7 +140,7 @@ def init_clients(robot, mission_file, walk_directory, do_map_load, disable_alter
     if do_map_load:
         if not os.path.isdir(walk_directory):
             robot.logger.fatal(f'Unable to find walk directory: {walk_directory}.')
-            sys.exit(1)
+            return None, None, None, None
 
         # Create graph-nav client
         robot.logger.info('Creating graph-nav client...')
@@ -226,39 +155,25 @@ def init_clients(robot, mission_file, walk_directory, do_map_load, disable_alter
         upload_graph_and_snapshots(robot, graph_nav_client, walk_directory,
                                    disable_alternate_route_finding, upload_timeout)
 
-        # Here we assume the input file is an autowalk file so we parse it as a walk proto
-        # and upload through the autowalk service.
-        # If that fails we try parsing as a node and uploading through the mission service.
+        # Try autowalk upload; fallback to mission upload if needed
         try:
             upload_autowalk(robot, autowalk_client, mission_file, upload_timeout)
-        except google.protobuf.message.DecodeError:
+        except Exception:
             robot.logger.warning(
-                f'Failed to parse autowalk proto from {mission_file}. Attempting to parse as node proto.'
+                f'Failed to parse/load autowalk from {mission_file}. Attempting to parse as node proto.'
             )
             upload_mission(robot, mission_client, mission_file, upload_timeout)
-
     else:
         # Upload mission to robot
         upload_mission(robot, mission_client, mission_file, upload_timeout)
 
-    # Create command client
+    # Create command + state clients
     robot.logger.info('Creating command client...')
     command_client = robot.ensure_client(RobotCommandClient.default_service_name)
-
-    # Create robot state client
     robot.logger.info('Creating robot state client...')
     robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
 
     return robot_state_client, command_client, mission_client, graph_nav_client
-
-
-def countdown(length):
-    """Print sleep countdown"""
-
-    for i in range(length, 0, -1):
-        print(i, end=' ', flush=True)
-        time.sleep(1)
-    print(0)
 
 
 def upload_graph_and_snapshots(robot, client, path, disable_alternate_route_finding,
@@ -288,7 +203,6 @@ def upload_graph_and_snapshots(robot, client, path, disable_alternate_route_find
             continue
         snapshot_filename = os.path.join(path, 'waypoint_snapshots', waypoint.snapshot_id)
         robot.logger.info(f'Loading waypoint snapshot from {snapshot_filename}')
-
         with open(snapshot_filename, 'rb') as snapshot_file:
             waypoint_snapshot = map_pb2.WaypointSnapshot()
             waypoint_snapshot.ParseFromString(snapshot_file.read())
@@ -301,7 +215,6 @@ def upload_graph_and_snapshots(robot, client, path, disable_alternate_route_find
             continue
         snapshot_filename = os.path.join(path, 'edge_snapshots', edge.snapshot_id)
         robot.logger.info(f'Loading edge snapshot from {snapshot_filename}')
-
         with open(snapshot_filename, 'rb') as snapshot_file:
             edge_snapshot = map_pb2.EdgeSnapshot()
             edge_snapshot.ParseFromString(snapshot_file.read())
@@ -335,16 +248,12 @@ def upload_autowalk(robot, autowalk_client, filename, upload_timeout):
     autowalk_proto = walks_pb2.Walk()
     with open(filename, 'rb') as walk_file:
         data = walk_file.read()
-        try:
-            autowalk_proto.ParseFromString(data)
-        except google.protobuf.message.DecodeError as exc:
-            raise exc
+        autowalk_proto.ParseFromString(data)
 
     # Upload the mission to the robot and report the load_autowalk_response
     robot.logger.info('Uploading the autowalk to the robot...')
     try:
-        load_autowalk_response = autowalk_client.load_autowalk(autowalk_proto,
-                                                               timeout=upload_timeout)
+        autowalk_client.load_autowalk(autowalk_proto, timeout=upload_timeout)
     except AutowalkResponseError as resp_err:
         load_autowalk_response = resp_err.response
         print(f'failed_nodes:\n{load_autowalk_response.failed_nodes}')
@@ -378,8 +287,7 @@ def run_mission(robot, mission_client, lease_client, fail_on_question, mission_t
     mission_state = mission_client.get_state()
 
     while mission_state.status in (mission_pb2.State.STATUS_NONE, mission_pb2.State.STATUS_RUNNING):
-        # We optionally fail if any questions are triggered. This often indicates a problem in
-        # Autowalk missions.
+        # Optionally fail if any questions are triggered (common in Autowalks).
         if mission_state.questions and fail_on_question:
             robot.logger.info(
                 f'Mission failed by triggering operator question: {mission_state.questions}')
@@ -452,5 +360,22 @@ def repeat_mission(robot, mission_client, lease_client, total_time, fail_on_ques
     return mission_success
 
 
-if __name__ == '__main__':
-    main()
+def play(robot, walk_directory: str = None, walk_filename: str = None, **kwargs) -> bool:
+    """Simplified one-call interface using defaults or overrides."""
+    wd = walk_directory or WALK_DIR
+    wf = walk_filename or WALK_FILE
+    opts = {**WALK_DEFAULTS, **kwargs}
+
+    return run(
+        robot,
+        walk_directory=wd,
+        walk_filename=wf,
+        upload_timeout=opts["upload_timeout"],
+        mission_timeout=opts["mission_timeout"],
+        noloc=opts["noloc"],
+        disable_alternate_route_finding=opts["disable_alternate_route_finding"],
+        disable_directed_exploration=opts["disable_directed_exploration"],
+        strict_mode=opts["strict_mode"],
+        duration=opts["duration"],
+        static_mode=opts["static_mode"],
+    )

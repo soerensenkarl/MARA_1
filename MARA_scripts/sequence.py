@@ -8,8 +8,8 @@ import bosdyn.mission.client
 from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
 from bosdyn.client.robot_command import RobotCommandClient, blocking_stand
 import place_brick
-import walk_action as walk
-import pick_brick_lib as pick
+import walk
+import pick_brick as pick
 
 # ---- Set once here (or swap to env vars) ----
 HOST = "192.168.80.3"
