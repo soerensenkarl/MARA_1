@@ -34,7 +34,7 @@ SE3 = math_helpers.SE3Pose
 # ---------------------------------------------------------------------------
 
 TAG_ID = 4                 # AprilTag ID to follow
-SECONDS_PER_STEP = 1.5     # time per move
+SECONDS_PER_STEP = 2.0     # time per move
 CUMULATIVE = False         # if True, steps build on each other
 SEND_IN_ODOM = False       # command frame (False = vision)
 
@@ -47,12 +47,117 @@ DEFAULT_PITCH_DEG = 90  # “looking down” if a step doesn't specify pitch
 
 # Each step can be (dx, dy, dz) or (dx, dy, dz, pitch_deg)
 STEPS = [
-    (0.00,  0.00, 0.10),            # uses DEFAULT_PITCH_DEG
-    (0.00,  0.20, 0.10),     # custom pitch
-    (0.00, -0.20, 0.10),            # uses DEFAULT_PITCH_DEG
-]
+    (-0.30, 0.00, 0.70, 0.0, 0.65),
+    (-0.30, 0.00, 0.70, 0.0, 0.65),
+    (-0.30, 0.00, 0.70, 0.0, 0.4),
+    (-0.30, 0.00, 0.70),
+    (-0.30, 0.00, 0.30),
+    (-0.30, 0.00, 0.05),
+    (-0.30, 0.00, 0.05, 'open'),
+    (-0.32, 0.00, 0.05),
 
+    (-0.30, 0.00, 0.70, 0.0, 0.65),
+    (-0.30, 0.00, 0.70, 0.0, 0.65),
+    (-0.30, 0.00, 0.70, 0.0, 0.4),
+    (-0.30, 0.00, 0.70),
+    (-0.30, 0.22, 0.30),
+    (-0.30, 0.22, 0.05),
+    (-0.30, 0.22, 0.05, 'open'),
+    (-0.32, 0.22, 0.05),    
+
+    (-0.30, 0.00, 0.70, 0.0, 0.65),
+    (-0.30, 0.00, 0.70, 0.0, 0.65),
+    (-0.30, 0.00, 0.70, 0.0, 0.4),
+    (-0.30, 0.00, 0.70),
+    (-0.30, -0.22, 0.30),
+    (-0.30, -0.22, 0.05),
+    (-0.30, -0.22, 0.05, 'open'),
+    (-0.32, -0.22, 0.05),    
+
+################# Next layer #################
+
+    (-0.30, 0.00, 0.70, 0.0, 0.65),
+    (-0.30, 0.00, 0.70, 0.0, 0.65),
+    (-0.30, 0.00, 0.70, 0.0, 0.65),
+    (-0.30, 0.00, 0.70, 0.0, 0.4),
+    (-0.30, 0.00, 0.70),
+    (-0.30, 0.11, 0.30),
+    (-0.30, 0.11, 0.12),
+    (-0.30, 0.11, 0.12, 'open'),
+    (-0.32, 0.11, 0.12),
+
+    (-0.30, 0.00, 0.70, 0.0, 0.65),
+    (-0.30, 0.00, 0.70, 0.0, 0.65),
+    (-0.30, 0.00, 0.70, 0.0, 0.65),
+    (-0.30, 0.00, 0.70, 0.0, 0.4),
+    (-0.30, 0.00, 0.70),
+    (-0.30, -0.11, 0.30),
+    (-0.30, -0.11, 0.12),
+    (-0.30, -0.11, 0.12, 'open'),
+    (-0.32, -0.11, 0.12),  
+
+############### FINAL LAYER ##################
+
+    (-0.30, 0.00, 0.70, 0.0, 0.65),
+    (-0.30, 0.00, 0.70, 0.0, 0.65),
+    (-0.30, 0.00, 0.70, 0.0, 0.65),
+    (-0.30, 0.00, 0.70, 0.0, 0.4),
+    (-0.30, 0.00, 0.70),
+    (-0.30, 0.00, 0.30),
+    (-0.30, 0.00, 0.18),
+    (-0.30, 0.00, 0.18, 'open'),
+    (-0.32, 0.00, 0.18),
+
+
+    # (0.00, 0.00, 0.10, 'open'),
+    # (0.00, 0.00, 0.20, 0.0),          # move + pitch
+    # (0.00, 0.00, 0.10, 'open'),         # move + open (uses default pitch)
+    # (0.00, 0.00, 0.10, 0.0, 'close'), # move + pitch + close
+    # (0.00, 0.00, 0.10, 0.0, 0.4),       # move + pitch + 40% open
+]
 # ---------------------------------------------------------------------------
+
+def _parse_grip(grip_val) -> Optional[float]:
+    """Return open fraction in [0,1], or None to keep current."""
+    if grip_val is None:
+        return None
+    if isinstance(grip_val, bool):
+        return 1.0 if grip_val else 0.0
+    if isinstance(grip_val, (int, float)):
+        return max(0.0, min(1.0, float(grip_val)))
+    if isinstance(grip_val, str):
+        g = grip_val.strip().lower()
+        if g in ('open', 'o'):
+            return 1.0
+        if g in ('close', 'closed', 'c'):
+            return 0.0
+    raise ValueError("Grip must be one of: 'open'/'close'/True/False/float[0..1].")
+
+def _split_step(step):
+    """Accept (dx,dy,dz), (dx,dy,dz,pitch), (dx,dy,dz,'open'), or (dx,dy,dz,pitch,grip)."""
+    if len(step) == 3:
+        dx, dy, dz = step
+        pitch_deg = DEFAULT_PITCH_DEG
+        grip = None
+    elif len(step) == 4:
+        dx, dy, dz, fourth = step
+        # If 4th is numeric -> pitch; else treat as gripper
+        if isinstance(fourth, (int, float)) and not isinstance(fourth, bool):
+            pitch_deg = float(fourth)
+            grip = None
+        else:
+            pitch_deg = DEFAULT_PITCH_DEG
+            grip = _parse_grip(fourth)
+    elif len(step) == 5:
+        dx, dy, dz, pitch_deg, grip_val = step
+        pitch_deg = float(pitch_deg)
+        grip = _parse_grip(grip_val)
+    else:
+        raise ValueError("Each step must be (dx,dy,dz), (dx,dy,dz,pitch), "
+                         "(dx,dy,dz,grip), or (dx,dy,dz,pitch,grip).")
+    return dx, dy, dz, pitch_deg, grip
+
+
 
 def _quat_from_pitch_deg(pitch_deg: float) -> math_helpers.Quat:
     """Create a quaternion rotated 'pitch_deg' about the Y axis."""
@@ -96,48 +201,42 @@ def _find_fiducial(robot, tag_id: Optional[int], wait_sec: float = 3.0):
     return fid_frame, vision_T_fid
 
 
-def _send_pose(robot, command_client, pose: SE3, frame_name: str, seconds: float):
-    """Send a single arm pose, optionally with body-follow + mobility assist, and block until done."""
-    # Arm pose.
+def _send_pose(robot, command_client, pose: SE3, frame_name: str, seconds: float,
+               grip_open_frac: Optional[float]):
+    """Send arm pose (+ optional gripper), with body-follow + mobility assist, and wait."""
     arm_cmd = RobotCommandBuilder.arm_pose_command(
         pose.x, pose.y, pose.z,
         pose.rot.w, pose.rot.x, pose.rot.y, pose.rot.z,
         frame_name, seconds
     )
 
-    # Stand with mobility params so Spot can lower/adjust to help the arm.
     stand_cmd = RobotCommandBuilder.synchro_stand_command(params=_mobility_params())
 
-    # Optionally tell the base to follow the hand.
+    subcmds = []
     if USE_BODY_FOLLOW:
-        follow_cmd = RobotCommandBuilder.follow_arm_command()
-        # Just pass commands positionally—no build_on_command kwarg.
-        command = RobotCommandBuilder.build_synchro_command(follow_cmd, arm_cmd, stand_cmd)
-    else:
-        command = RobotCommandBuilder.build_synchro_command(stand_cmd, arm_cmd)
+        subcmds.append(RobotCommandBuilder.follow_arm_command())
 
+    # Order isn’t strict; include stand so hip-height assist can do its thing.
+    subcmds.extend([arm_cmd, stand_cmd])
+
+    # Optional gripper command (only if specified this step)
+    if grip_open_frac is not None:
+        grip_cmd = RobotCommandBuilder.claw_gripper_open_fraction_command(grip_open_frac)
+        subcmds.append(grip_cmd)
+
+    command = RobotCommandBuilder.build_synchro_command(*subcmds)
     cmd_id = command_client.robot_command(command)
     block_until_arm_arrives(command_client, cmd_id)
-
 
 
 def run(robot):
     robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
     command_client = robot.ensure_client(RobotCommandClient.default_service_name)
 
-    acc = SE3(0, 0, 0, math_helpers.Quat())  # start with identity; rotation handled per-step
+    acc = SE3(0, 0, 0, math_helpers.Quat())  # rotation controlled per-step
 
     for i, step in enumerate(STEPS, start=1):
-        # Parse (dx, dy, dz[, pitch_deg])
-        if len(step) == 3:
-            dx, dy, dz = step
-            pitch_deg = DEFAULT_PITCH_DEG
-        elif len(step) == 4:
-            dx, dy, dz, pitch_deg = step
-        else:
-            raise ValueError("Each step must be (dx, dy, dz) or (dx, dy, dz, pitch_deg).")
-
-        # Per-step rotation: “looking down” by default or the provided pitch
+        dx, dy, dz, pitch_deg, grip = _split_step(step)
         step_rot = _quat_from_pitch_deg(pitch_deg)
 
         fid_name, vision_T_fid = _find_fiducial(robot, tag_id=TAG_ID)
@@ -149,10 +248,9 @@ def run(robot):
             step_rot,
         )
         if CUMULATIVE:
-            # Accumulate position only; keep rotation controlled per-step (not cumulative).
-            acc = SE3(offset.x, offset.y, offset.z, acc.rot)
+            acc = SE3(offset.x, offset.y, offset.z, acc.rot)  # keep rotation separate
 
-        # Compute target pose in chosen root frame
+        # Compute target pose
         if SEND_IN_ODOM:
             rs = robot_state_client.get_robot_state()
             tf = rs.kinematic_state.transforms_snapshot
@@ -165,14 +263,15 @@ def run(robot):
             target_pose = vision_T_fid * offset
             frame_used = VISION_FRAME_NAME
 
+        grip_str = "keep" if grip is None else (f"{grip:.2f}" if isinstance(grip, float) else str(grip))
         robot.logger.info(
             f"[{i}/{len(STEPS)}] Move to {fid_name} + "
             f"({offset.x:.3f}, {offset.y:.3f}, {offset.z:.3f}) m in {frame_used} "
-            f"pitch={pitch_deg:.1f}° "
+            f"pitch={pitch_deg:.1f}°, grip={grip_str}, "
             f"[body_follow={'ON' if USE_BODY_FOLLOW else 'OFF'}, hip_assist={'ON' if ENABLE_HIP_HEIGHT_ASSIST else 'OFF'}]"
         )
 
-        _send_pose(robot, command_client, target_pose, frame_used, SECONDS_PER_STEP)
+        _send_pose(robot, command_client, target_pose, frame_used, SECONDS_PER_STEP, grip)
 
     robot.logger.info("place_brick.run() chain complete.")
 
