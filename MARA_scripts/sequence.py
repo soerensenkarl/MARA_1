@@ -7,7 +7,7 @@ import bosdyn.client.util
 import bosdyn.mission.client
 from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
 from bosdyn.client.robot_command import RobotCommandClient, blocking_stand
-import arm_simple
+import place_brick
 import walk_action as walk
 import pick_brick_lib as pick
 
@@ -55,23 +55,29 @@ def main():
 
         # ---- Call actions (they assume standing & ready) ----
 
-        pick_ok = pick.run(
+        # pick_ok = pick.run(
+        #     robot,
+        #     image_source="frontleft_fisheye_image",
+        #     force_top_down_grasp=True,
+        #     click_ui=True,            # show window, click to pick
+        #     pixel_xy=None,            # or set a pixel programmatically
+        # )
+        # assert pick_ok, "Pick (hand camera) failed."
+
+        # robot.logger.info("Starting Autowalk…")
+        # walk_ok = walk.play(robot)
+        # assert walk_ok, "Autowalk failed."
+
+        place_brick.run(
             robot,
-            image_source="frontleft_fisheye_image",
-            force_top_down_grasp=True,
-            click_ui=True,            # show window, click to pick
-            pixel_xy=None,            # or set a pixel programmatically
+            seconds=2.0,
+            tag_id=4,          # your printed tag is "4"
+            target_x=0.00,     # 20 cm to the right of the tag
+            target_y=0.00,
+            target_z=0.10,     # 20 cm above the tag
+            # send_in_odom=False,  # default; set True if you prefer ODOM
+            # do_stow=True,        # optional: stow after move
         )
-        assert pick_ok, "Pick (hand camera) failed."
-
-        robot.logger.info("Starting Autowalk…")
-        walk_ok = walk.play(robot)
-        assert walk_ok, "Autowalk failed."
-
-
-        arm_simple.run(robot, seconds=2.0)
-        arm_simple.run(robot, seconds=2.0)
-        # arm_simple.run(robot, seconds=2.0)
 
         # ---- Finish: safe sit + power off ----
         robot.logger.info("Sequence complete. Powering off (safe sit)…")

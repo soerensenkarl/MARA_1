@@ -34,8 +34,8 @@ from bosdyn.client.robot_command import RobotCommandClient
 from bosdyn.client.robot_state import RobotStateClient
 
 # Default autowalk config (you can override via env vars or function args)
-WALK_DIR = os.environ.get("WALK_DIR", r"C:\MARA_1\MARA_scripts\fetch-place.walk")  # change this if needed
-WALK_FILE = os.environ.get("WALK_FILE", "fetch-place.walk")  # change this if needed
+WALK_DIR = os.environ.get("WALK_DIR", r"C:\MARA_1\MARA_scripts\walk.walk")  # change this if needed
+WALK_FILE = os.environ.get("WALK_FILE", "walk.walk")  # change this if needed
 
 # Default runtime options
 WALK_DEFAULTS = {

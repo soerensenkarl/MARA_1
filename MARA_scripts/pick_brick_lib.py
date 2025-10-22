@@ -20,6 +20,16 @@ from bosdyn.client.robot_command import (
     block_until_arm_arrives,
 )
 
+from bosdyn.client.robot_command import (
+    RobotCommandClient,
+    RobotCommandBuilder,
+    block_until_arm_arrives,
+)
+from bosdyn.client.robot_state import RobotStateClient
+from bosdyn.client import frame_helpers
+from bosdyn.api import geometry_pb2
+import time
+
 # ---- UI globals (reused from the tutorial) ----
 g_image_click = None
 g_image_display = None
@@ -189,37 +199,50 @@ def run(
     success = fb.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED
     robot.logger.info("Finished grasp: %s", "SUCCESS" if success else "FAILED")
 
-        # ---- NEW: Stow arm while keeping grasp closed ----
-     # ---- Move to carry (lift) while keeping grip, then stow ----
-     
-    if success and stow_after_grasp:
-        cmd_client = robot.ensure_client(RobotCommandClient.default_service_name)
 
-        # Keep the gripper closed (0.0 = fully closed).
-        grip_closed = RobotCommandBuilder.claw_gripper_open_fraction_command(0.0)
+    if success:
+        robot.logger.info("Grasp succeeded → up 30 cm → back 20 cm → stow.")
+        from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient, block_until_arm_arrives
+        from bosdyn.client.frame_helpers import BODY_FRAME_NAME, HAND_FRAME_NAME, get_a_tform_b
 
-        # 1) Lift to a safe transport pose.
-        carry_cmd = RobotCommandBuilder.arm_carry_command()
-        carry_syn = RobotCommandBuilder.build_synchro_command(grip_closed, carry_cmd)
+        command_client = robot.ensure_client(RobotCommandClient.default_service_name)
+        robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
 
-        robot.logger.info("Moving arm to CARRY pose while maintaining grasp…")
-        carry_id = cmd_client.robot_command(carry_syn)
-        try:
-            block_until_arm_arrives(cmd_client, carry_id, timeout_sec=15.0)
-            robot.logger.info("Arm in CARRY pose.")
-        except Exception as e:
-            robot.logger.warning(f"Carry wait failed (continuing to stow anyway): {e}")
+        # --- 1) Move UP +0.30 m in BODY z ---
+        robot_state = robot_state_client.get_robot_state()
+        transforms = robot_state.kinematic_state.transforms_snapshot
+        body_T_hand = get_a_tform_b(transforms, BODY_FRAME_NAME, HAND_FRAME_NAME)
 
-        # 2) Now stow (still keep gripper closed).
-        stow_cmd = RobotCommandBuilder.arm_stow_command()
-        stow_syn = RobotCommandBuilder.build_synchro_command(grip_closed, stow_cmd)
+        target_up_x = body_T_hand.x
+        target_up_y = body_T_hand.y
+        target_up_z = body_T_hand.z + 0.70  # +70 cm up
 
-        robot.logger.info("Stowing arm while maintaining grasp…")
-        stow_id = cmd_client.robot_command(stow_syn)
-        try:
-            block_until_arm_arrives(cmd_client, stow_id, timeout_sec=20.0)
-            robot.logger.info("Arm stowed.")
-        except Exception as e:
-            robot.logger.warning(f"Stow wait failed: {e}")
+        arm_up_cmd = RobotCommandBuilder.arm_pose_command(
+            target_up_x, target_up_y, target_up_z,
+            body_T_hand.rot.w, body_T_hand.rot.x, body_T_hand.rot.y, body_T_hand.rot.z,
+            BODY_FRAME_NAME, 2
+        )
+        cmd_id = command_client.robot_command(RobotCommandBuilder.build_synchro_command(arm_up_cmd))
+        block_until_arm_arrives(command_client, cmd_id)
+
+        # --- 2) Move BACK −0.20 m in BODY x (keep the new z) ---
+        robot_state = robot_state_client.get_robot_state()  # refresh after the lift
+        transforms = robot_state.kinematic_state.transforms_snapshot
+        body_T_hand = get_a_tform_b(transforms, BODY_FRAME_NAME, HAND_FRAME_NAME)
+
+        target_back_x = body_T_hand.x - 0.20  # −20 cm back
+        target_back_y = body_T_hand.y
+        target_back_z = body_T_hand.z         # keep current height
+
+        arm_back_cmd = RobotCommandBuilder.arm_pose_command(
+            target_back_x, target_back_y, target_back_z,
+            body_T_hand.rot.w, body_T_hand.rot.x, body_T_hand.rot.y, body_T_hand.rot.z,
+            BODY_FRAME_NAME, 1
+        )
+        cmd_id = command_client.robot_command(RobotCommandBuilder.build_synchro_command(arm_back_cmd))
+        block_until_arm_arrives(command_client, cmd_id)
+
+
+
 
     return success
