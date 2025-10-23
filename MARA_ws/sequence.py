@@ -27,10 +27,18 @@ def load_credentials(path: Path):
 
 
 # Load brick coordinates from json file (same folder as this script)
-script_dir = Path(__file__).parent
-json_path = script_dir / "wall.json"
-with open(json_path, "r") as f:
-    brick_positions = json.load(f)
+# --- load brick positions from wall.json (must sit next to sequence.py) ---
+WALL_FILE = Path(__file__).with_name("wall.json")
+with WALL_FILE.open("r", encoding="utf-8") as f:
+    brick_positions = json.load(f)  # expects a list of [x, y, z] triples
+if not isinstance(brick_positions, list) or not all(isinstance(p, (list, tuple)) and len(p) == 3 for p in brick_positions):
+    raise ValueError(f"wall.json must be a list of [x, y, z] items. Got: {type(brick_positions)}")
+# -------------------------------------------------------------------------
+
+
+WALK_TO_WALL = "to_wall.walk"
+WALK_TO_SOURCE = "to_source.walk"
+
 
 
 def main():
@@ -63,26 +71,31 @@ def main():
         for i, brick in enumerate(brick_positions):
             robot.logger.info(f"Starting sequence for brick {i+1}/{len(brick_positions)}")
 
-            # Your current sequence (unchanged)
             # 1. Pick brick
-            # pick_ok = pick.run(
-            #     robot,
-            #     image_source="frontleft_fisheye_image",
-            #     force_top_down_grasp=True,
-            #     click_ui=True,
-            #     pixel_xy=None,
-            # )
-            # assert pick_ok, "Pick (hand camera) failed."
+            pick_ok = pick.run(
+                robot,
+                image_source="frontleft_fisheye_image",
+                force_top_down_grasp=True,
+                click_ui=True,
+                pixel_xy=None,
+            )
+            assert pick_ok, "Pick (hand camera) failed."
 
-            # 2. Autowalk
-            # robot.logger.info("Starting Autowalk…")
-            # walk_ok = walk.play(robot)
-            # assert walk_ok, "Autowalk failed."
+            # 2. Autowalk to the wall
+            robot.logger.info("Autowalk: to_wall.walk …")
+            walk_ok = walk.play_named(robot, WALK_TO_WALL)
+            assert walk_ok, "Autowalk to_wall.walk failed."
 
-            # 3. Place brick
-            place_brick.run(robot, target=(-0.30, 0.2, 0.05))
+            # 3. Place brick at target from wall.json
+            x, y, z = map(float, brick_positions[i])  # each item is [x, y, z]
+            robot.logger.info(f"Placing brick {i+1}/{len(brick_positions)} at target (x={x:.3f}, y={y:.3f}, z={z:.3f})")
+            place_brick.run(robot, target=(x, y, z))  # do not pass 'seconds' here
 
-            robot.logger.info(f"Finished brick {i+1}/{len(brick_positions)}")
+            # 4. Autowalk back to the source
+            robot.logger.info("Autowalk: to_source.walk …")
+            walk_ok = walk.play_named(robot, WALK_TO_SOURCE)
+            assert walk_ok, "Autowalk to_source.walk failed."
+
 
         # ---- Finish: safe sit + power off ----
         robot.logger.info("All bricks complete. Powering off (safe sit)…")

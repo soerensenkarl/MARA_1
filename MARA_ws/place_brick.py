@@ -50,15 +50,50 @@ DEFAULT_PITCH_DEG = 90  # “looking down” if a step doesn't specify pitch
 
 # Each step can be (dx, dy, dz) or (dx, dy, dz, pitch_deg) or include a gripper token.
 # (Back-compat STEPS removed — run(...) now requires an explicit target.)
-def lay_brick(x: float, y: float, z: float) -> List[Tuple]:
 
+def move(x: float, y: float, z: float, *, pitch: Optional[float] = None,
+         time: Optional[float] = None, grip=None) -> dict:
+    """
+    User-friendly step:
+    Returns a dict the parser understands.
+    """
+    return {
+        'x': float(x), 'y': float(y), 'z': float(z),
+        'pitch': None if pitch is None else float(pitch),
+        'seconds': None if time is None else float(time),
+        'grip': grip
+    }
+
+
+def lay_brick(x: float, y: float, z: float):
+    """
+    Return a list of steps. You can mix formats:
+      - move(x,y,z, pitch=..., time=..., grip=...)  <-- recommended
+      - (dx,dy,dz)
+      - (dx,dy,dz,pitch)
+      - (dx,dy,dz,'open'|'close'|bool|float[0..1])
+      - (dx,dy,dz,pitch,grip)
+      - (dx,dy,dz,pitch,grip,seconds)
+      - (dx,dy,dz,grip,seconds)
+      - (dx,dy,dz,pitch,seconds)
+    """
     return [
-        (x, y, z + 0.30),
-        (x, y, z),
-        (x, y, z, 'open'),
-        (x - 0.02, y, z),
-        (x, y, 0.70),
+        # Take brick
+        # move(0, -1, 0.70, grip = 0.65, pitch = 0.00, time=2),
+        # move(0, -1, 0.70, grip = 0.65, pitch = 0.00, time=2),
+        # move(0, -1, 0.70, grip = 0.4, pitch = 0.00, time=0),
+        # move(0, -1, 0.70, grip = 0.4, pitch = 0.00, time=1.5),
+        # move(x, y, 0.50, grip= 0.4),
+
+        # place brick
+        move(x, y, z + 0.30, time=1),
+        move(x, y, z + 0.06),
+        move(x, y, z + 0.06, grip='open', time=0.0),                       # down (default time)
+        move(x - 0.02, y, z + 0.06, time = 0.5),
+        move(x, y, 0.3, time=0.5),
+        move(-0.5, 0, 0.7, pitch = 0.0)                                # back off
     ]
+
 
 
 def _parse_grip(grip_val) -> Optional[float]:
@@ -79,28 +114,82 @@ def _parse_grip(grip_val) -> Optional[float]:
 
 
 def _split_step(step):
-    """Accept (dx,dy,dz), (dx,dy,dz,pitch), (dx,dy,dz,'open'), or (dx,dy,dz,pitch,grip)."""
-    if len(step) == 3:
-        dx, dy, dz = step
-        pitch_deg = DEFAULT_PITCH_DEG
-        grip = None
-    elif len(step) == 4:
-        dx, dy, dz, fourth = step
-        # If 4th is numeric -> pitch; else treat as gripper
+    """
+    Parses either:
+      - dict from move(...): {'x','y','z','pitch','seconds','grip'}
+      - tuples:
+          (dx,dy,dz)
+          (dx,dy,dz,pitch)
+          (dx,dy,dz,grip)
+          (dx,dy,dz,pitch,grip)
+          (dx,dy,dz,pitch,grip,seconds)
+          (dx,dy,dz,grip,seconds)
+          (dx,dy,dz,pitch,seconds)
+    Returns: (dx, dy, dz, pitch_deg, grip, seconds_opt)
+    """
+    # Dict form (preferred)
+    if isinstance(step, dict):
+        for k in ('x', 'y', 'z'):
+            if k not in step:
+                raise ValueError("move(...) dict must include x, y, z.")
+        dx, dy, dz = float(step['x']), float(step['y']), float(step['z'])
+        pitch_deg = float(step['pitch']) if step.get('pitch') is not None else DEFAULT_PITCH_DEG
+        seconds = float(step['seconds']) if step.get('seconds') is not None else None
+        grip = _parse_grip(step.get('grip')) if ('grip' in step and step['grip'] is not None) else None
+        return dx, dy, dz, pitch_deg, grip, seconds
+
+    # Tuple forms
+    n = len(step)
+    if n < 3:
+        raise ValueError("Step must have at least (dx,dy,dz).")
+
+    dx, dy, dz = step[0], step[1], step[2]
+    pitch_deg = DEFAULT_PITCH_DEG
+    grip = None
+    seconds = None
+
+    if n == 3:
+        pass
+
+    elif n == 4:
+        fourth = step[3]
         if isinstance(fourth, (int, float)) and not isinstance(fourth, bool):
+            # Interpret as pitch (back-compat)
             pitch_deg = float(fourth)
-            grip = None
         else:
-            pitch_deg = DEFAULT_PITCH_DEG
+            # Interpret as grip
             grip = _parse_grip(fourth)
-    elif len(step) == 5:
-        dx, dy, dz, pitch_deg, grip_val = step
-        pitch_deg = float(pitch_deg)
-        grip = _parse_grip(grip_val)
+
+    elif n == 5:
+        fourth, fifth = step[3], step[4]
+        if isinstance(fourth, (int, float)) and not isinstance(fourth, bool):
+            # (dx,dy,dz,pitch, ? )
+            pitch_deg = float(fourth)
+            if isinstance(fifth, (int, float)) and not isinstance(fifth, bool):
+                # seconds
+                seconds = float(fifth)
+            else:
+                # grip
+                grip = _parse_grip(fifth)
+        else:
+            # (dx,dy,dz,grip,seconds?)
+            grip = _parse_grip(fourth)
+            if isinstance(fifth, (int, float)) and not isinstance(fifth, bool):
+                seconds = float(fifth)
+            else:
+                raise ValueError("5th element should be seconds (number) when 4th is grip.")
+
+    elif n == 6:
+        # (dx,dy,dz,pitch,grip,seconds)
+        pitch_deg = float(step[3])
+        grip = _parse_grip(step[4])
+        seconds = float(step[5])
+
     else:
-        raise ValueError("Each step must be (dx,dy,dz), (dx,dy,dz,pitch), "
-                         "(dx,dy,dz,grip), or (dx,dy,dz,pitch,grip).")
-    return dx, dy, dz, pitch_deg, grip
+        raise ValueError("Step must be length 3..6 or a dict from move(...).")
+
+    return dx, dy, dz, pitch_deg, grip, seconds
+
 
 
 def _quat_from_pitch_deg(pitch_deg: float) -> math_helpers.Quat:
@@ -183,12 +272,12 @@ def run(robot, target: Tuple[float, float, float]):
     command_client = robot.ensure_client(RobotCommandClient.default_service_name)
 
     # Build steps for this run (STEPS deprecated; target is required).
-    steps_to_run: List[Tuple] = lay_brick(*target)
+    steps_to_run = lay_brick(*target)
 
     acc = SE3(0, 0, 0, math_helpers.Quat())  # rotation controlled per-step
 
     for i, step in enumerate(steps_to_run, start=1):
-        dx, dy, dz, pitch_deg, grip = _split_step(step)
+        dx, dy, dz, pitch_deg, grip, step_seconds = _split_step(step)
         step_rot = _quat_from_pitch_deg(pitch_deg)
 
         fid_name, vision_T_fid = _find_fiducial(robot, tag_id=TAG_ID)
@@ -215,17 +304,29 @@ def run(robot, target: Tuple[float, float, float]):
             target_pose = vision_T_fid * offset
             frame_used = VISION_FRAME_NAME
 
+        secs_used = step_seconds if step_seconds is not None else SECONDS_PER_STEP
         grip_str = "keep" if grip is None else (f"{grip:.2f}" if isinstance(grip, float) else str(grip))
+
         robot.logger.info(
             f"[{i}/{len(steps_to_run)}] Move to {fid_name} + "
             f"({offset.x:.3f}, {offset.y:.3f}, {offset.z:.3f}) m in {frame_used} "
-            f"pitch={pitch_deg:.1f}°, grip={grip_str}, "
+            f"pitch={pitch_deg:.1f}°, grip={grip_str}, seconds={secs_used:.2f}, "
             f"[body_follow={'ON' if USE_BODY_FOLLOW else 'OFF'}, hip_assist={'ON' if ENABLE_HIP_HEIGHT_ASSIST else 'OFF'}]"
         )
 
-        _send_pose(robot, command_client, target_pose, frame_used, SECONDS_PER_STEP, grip)
+        # ✅ Send the command for THIS step, using per-step time.
+        _send_pose(robot, command_client, target_pose, frame_used, secs_used, grip)
+            # --- After placing the brick ---
+    robot.logger.info("Stowing arm after placing brick.")
+    command_client = robot.ensure_client(RobotCommandClient.default_service_name)
+    stow_cmd = RobotCommandBuilder.arm_stow_command()
+    stow_command_id = command_client.robot_command(stow_cmd)
+    block_until_arm_arrives(command_client, stow_command_id, timeout_sec=3.0)
+    robot.logger.info("Arm successfully stowed.")
+
 
     robot.logger.info("place_brick.run() chain complete.")
+
 
 
 # Optional back-compat helper (unchanged)

@@ -388,6 +388,8 @@ def play(robot, walk_directory: str | Path = None, walk_filename: str = None, **
 
     opts = {**WALK_DEFAULTS, **kwargs}
 
+
+
     return run(
         robot,
         walk_directory=wd,
@@ -401,3 +403,16 @@ def play(robot, walk_directory: str | Path = None, walk_filename: str = None, **
         duration=opts["duration"],
         static_mode=opts["static_mode"],
     )
+
+# Convenience: play a walk when the folder name == .walk filename
+def play_named(robot, name: str, **kwargs) -> bool:
+    """
+    Example: name="to_wall.walk" expects:
+      - <this folder>/to_wall.walk/         (contains graph/, waypoint_snapshots/, edge_snapshots/, missions/)
+      - <this folder>/to_wall.walk/missions/to_wall.walk
+    """
+    from pathlib import Path
+    walk_dir = (SCRIPT_DIR / name)  # folder named the same as the .walk file
+    walk_file = name                # the .walk file inside missions/
+    return play(robot, walk_directory=walk_dir, walk_filename=walk_file, **kwargs)
+
