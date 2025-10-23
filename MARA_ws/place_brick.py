@@ -91,7 +91,6 @@ def lay_brick(x: float, y: float, z: float):
         move(x, y, z + 0.06, grip='open', time=0.0),                       # down (default time)
         move(x - 0.02, y, z + 0.06, time = 0.5),
         move(x, y, 0.3, time=0.5),
-        move(-0.5, 0, 0.7, pitch = 0.0)                                # back off
     ]
 
 
