@@ -1,6 +1,7 @@
 # sequence.py
 import time
 from pathlib import Path
+import json
 
 import bosdyn.client
 import bosdyn.client.util
@@ -13,9 +14,8 @@ import pick_brick as pick
 
 # ---- Set once here (or swap to env vars) ----
 HOST = "192.168.80.3"
-
-# Path to credentials file
 CRED_PATH = Path(r"C:\Users\soere\OneDrive\Desktop\spot_creds.txt")  # change this if needed
+
 
 def load_credentials(path: Path):
     """Read username/password from a two-line text file."""
@@ -26,12 +26,19 @@ def load_credentials(path: Path):
     return lines[0], lines[1]
 
 
+# Load brick coordinates from json file (same folder as this script)
+script_dir = Path(__file__).parent
+json_path = script_dir / "wall.json"
+with open(json_path, "r") as f:
+    brick_positions = json.load(f)
+
+
 def main():
     USER, PASS = load_credentials(CRED_PATH)
     
     sdk = bosdyn.client.create_standard_sdk(
-    "MARA_Sequence",
-    [bosdyn.mission.client.MissionClient]  # ← register Mission service like in Mission Replay example
+        "MARA_Sequence",
+        [bosdyn.mission.client.MissionClient]
     )
 
     robot = sdk.create_robot(HOST)
@@ -43,7 +50,7 @@ def main():
 
     lease_client = robot.ensure_client(LeaseClient.default_service_name)
     with LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True):
-        # Power on & STAND ONCE for the entire sequence
+        # Power on & stand once for the entire sequence
         robot.logger.info("Powering on…")
         robot.power_on(timeout_sec=20)
         assert robot.is_powered_on(), "Power on failed."
@@ -52,29 +59,33 @@ def main():
         robot.logger.info("Standing…")
         blocking_stand(cmd_client, timeout_sec=20)
 
+        # ---- Loop through all bricks ----
+        for i, brick in enumerate(brick_positions):
+            robot.logger.info(f"Starting sequence for brick {i+1}/{len(brick_positions)}")
 
-        # ---- Call actions (they assume standing & ready) ----
+            # Your current sequence (unchanged)
+            # 1. Pick brick
+            # pick_ok = pick.run(
+            #     robot,
+            #     image_source="frontleft_fisheye_image",
+            #     force_top_down_grasp=True,
+            #     click_ui=True,
+            #     pixel_xy=None,
+            # )
+            # assert pick_ok, "Pick (hand camera) failed."
 
-        #1.  Pick brick with hand camera
-        # pick_ok = pick.run(
-        #     robot,
-        #     image_source="frontleft_fisheye_image",
-        #     force_top_down_grasp=True,
-        #     click_ui=True,            # show window, click to pick
-        #     pixel_xy=None,            # or set a pixel programmatically
-        # )
-        # assert pick_ok, "Pick (hand camera) failed."
+            # 2. Autowalk
+            # robot.logger.info("Starting Autowalk…")
+            # walk_ok = walk.play(robot)
+            # assert walk_ok, "Autowalk failed."
 
-        # 2. Autowalk to build area
-        robot.logger.info("Starting Autowalk…")
-        walk_ok = walk.play(robot)
-        assert walk_ok, "Autowalk failed."
+            # 3. Place brick
+            place_brick.run(robot)
 
-        # 3. Place brick\
-        place_brick.run(robot)
+            robot.logger.info(f"Finished brick {i+1}/{len(brick_positions)}")
 
         # ---- Finish: safe sit + power off ----
-        robot.logger.info("Sequence complete. Powering off (safe sit)…")
+        robot.logger.info("All bricks complete. Powering off (safe sit)…")
         robot.power_off(cut_immediately=False, timeout_sec=20)
 
     robot.logger.info("Lease returned. Done.")
