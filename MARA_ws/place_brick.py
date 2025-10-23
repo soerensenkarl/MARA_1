@@ -8,10 +8,13 @@
 #
 # Designed to be called from sequence.py as:
 #     import place_brick
+#     place_brick.run(robot, target=(x, y, z))   # uses lay_brick(x, y, z)
+# or, for back-compat (uses the hardcoded STEPS below):
 #     place_brick.run(robot)
 
 import time
 from typing import List, Tuple, Optional
+
 import math
 
 from bosdyn.api import arm_command_pb2, world_object_pb2
@@ -45,17 +48,18 @@ ENABLE_HIP_HEIGHT_ASSIST = True  # if True, allow Spot to lower/adjust base heig
 # ---- User configuration ----
 DEFAULT_PITCH_DEG = 90  # “looking down” if a step doesn't specify pitch
 
-# Each step can be (dx, dy, dz) or (dx, dy, dz, pitch_deg)
-STEPS = [
-################# First layer #################
-    (-0.30, 0.00, 0.70),
-    (-0.30, 0.00, 0.30),
-    (-0.30, 0.00, 0.05),
-    (-0.30, 0.00, 0.05, 'open'),
-    (-0.32, 0.00, 0.05),
-    (-0.30, 0.00, 0.70),
-]
-# ---------------------------------------------------------------------------
+# Each step can be (dx, dy, dz) or (dx, dy, dz, pitch_deg) or include a gripper token.
+# (Back-compat STEPS removed — run(...) now requires an explicit target.)
+def lay_brick(x: float, y: float, z: float) -> List[Tuple]:
+
+    return [
+        (x, y, z + 0.30),
+        (x, y, z),
+        (x, y, z, 'open'),
+        (x - 0.02, y, z),
+        (x, y, 0.70),
+    ]
+
 
 def _parse_grip(grip_val) -> Optional[float]:
     """Return open fraction in [0,1], or None to keep current."""
@@ -72,6 +76,7 @@ def _parse_grip(grip_val) -> Optional[float]:
         if g in ('close', 'closed', 'c'):
             return 0.0
     raise ValueError("Grip must be one of: 'open'/'close'/True/False/float[0..1].")
+
 
 def _split_step(step):
     """Accept (dx,dy,dz), (dx,dy,dz,pitch), (dx,dy,dz,'open'), or (dx,dy,dz,pitch,grip)."""
@@ -98,11 +103,10 @@ def _split_step(step):
     return dx, dy, dz, pitch_deg, grip
 
 
-
 def _quat_from_pitch_deg(pitch_deg: float) -> math_helpers.Quat:
     """Create a quaternion rotated 'pitch_deg' about the Y axis."""
-    # Boston Dynamics helpers include from_pitch(radians)
     return math_helpers.Quat.from_pitch(math.radians(pitch_deg))
+
 
 def _mobility_params():
     """Mobility params that assist manipulation (hip height and optional yaw)."""
@@ -169,13 +173,21 @@ def _send_pose(robot, command_client, pose: SE3, frame_name: str, seconds: float
     block_until_arm_arrives(command_client, cmd_id)
 
 
-def run(robot):
+def run(robot, target: Tuple[float, float, float]):
+    """
+    Execute the steps to place a brick.
+
+    - target=(x,y,z) is required; deprecated STEPS usage removed.
+    """
     robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
     command_client = robot.ensure_client(RobotCommandClient.default_service_name)
 
+    # Build steps for this run (STEPS deprecated; target is required).
+    steps_to_run: List[Tuple] = lay_brick(*target)
+
     acc = SE3(0, 0, 0, math_helpers.Quat())  # rotation controlled per-step
 
-    for i, step in enumerate(STEPS, start=1):
+    for i, step in enumerate(steps_to_run, start=1):
         dx, dy, dz, pitch_deg, grip = _split_step(step)
         step_rot = _quat_from_pitch_deg(pitch_deg)
 
@@ -205,7 +217,7 @@ def run(robot):
 
         grip_str = "keep" if grip is None else (f"{grip:.2f}" if isinstance(grip, float) else str(grip))
         robot.logger.info(
-            f"[{i}/{len(STEPS)}] Move to {fid_name} + "
+            f"[{i}/{len(steps_to_run)}] Move to {fid_name} + "
             f"({offset.x:.3f}, {offset.y:.3f}, {offset.z:.3f}) m in {frame_used} "
             f"pitch={pitch_deg:.1f}°, grip={grip_str}, "
             f"[body_follow={'ON' if USE_BODY_FOLLOW else 'OFF'}, hip_assist={'ON' if ENABLE_HIP_HEIGHT_ASSIST else 'OFF'}]"

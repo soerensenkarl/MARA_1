@@ -80,7 +80,7 @@ def main():
             # assert walk_ok, "Autowalk failed."
 
             # 3. Place brick
-            place_brick.run(robot)
+            place_brick.run(robot, target=(-0.30, 0.2, 0.05))
 
             robot.logger.info(f"Finished brick {i+1}/{len(brick_positions)}")
 
