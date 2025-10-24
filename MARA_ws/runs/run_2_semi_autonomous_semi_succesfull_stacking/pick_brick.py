@@ -20,8 +20,6 @@ from bosdyn.client.robot_command import (
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.frame_helpers import VISION_FRAME_NAME, BODY_FRAME_NAME, HAND_FRAME_NAME, get_a_tform_b
 
-
-
 # ---- UI globals (reused from the tutorial) ----
 g_image_click = None
 g_image_display = None
@@ -190,18 +188,7 @@ def run(
         camera_model=image.source.pinhole,
     )
 
-    from bosdyn.api import manipulation_api_pb2 as mapb2
-
     grasp.grasp_params.grasp_palm_to_fingertip = 0.1  # more “palm”; use 0.8 for more “pinch”
-    
-
-    # Hint which camera was used for the click
-    if "hand" in image_source.lower():
-        grasp.grasp_params.manipulation_camera_source = mapb2.MANIPULATION_CAMERA_SOURCE_HAND
-    else:
-        grasp.grasp_params.manipulation_camera_source = mapb2.MANIPULATION_CAMERA_SOURCE_BODY
-
-    
 
     _add_grasp_constraint(
         {
