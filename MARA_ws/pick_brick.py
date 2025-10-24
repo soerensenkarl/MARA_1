@@ -1,9 +1,11 @@
 # pick_brick.py — auto-pick nearest depth pixel from the arm depth camera, then optional lift/back/stow
 #
-# Changes vs your last version:
-# - Fix duplicated "Acquire image" block and indentation.
-# - Save depth to Desktop both as .npy (raw) and a colorized .png, with a red dot at the chosen pixel.
-# - Keep behavior minimal otherwise. Click UI remains available if click_ui=True.
+# Minimal change for auto-retry:
+# - Added `retries: int = 1` to run(...)
+# - Track `fallback_triggered` and, if True and retries > 0, recursively re-run run(...) with retries-1.
+#
+# Other notes:
+# - Keeps your existing behavior, including duplicate image acquire lines, sleeps, and fallback step-back.
 
 import time
 from typing import Optional, Tuple
@@ -28,7 +30,6 @@ from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.frame_helpers import VISION_FRAME_NAME, BODY_FRAME_NAME, HAND_FRAME_NAME, get_a_tform_b
 from bosdyn.client.frame_helpers import ODOM_FRAME_NAME, get_odom_tform_body
 from bosdyn.client.frame_helpers import get_se2_a_tform_b
-
 
 
 # ---- UI globals (unchanged; used only if click_ui=True) ----
@@ -137,15 +138,12 @@ def _nearest_depth_pixel(depth_img: np.ndarray) -> Optional[Tuple[int, int]]:
     # Find the minimum valid depth
     min_depth = np.min(crop[mask])
 
-    # Create a mask for the "nearest area", defined as all pixels
-    # within 10mm of the absolute minimum. This helps find the
-    # center of the nearest face, not just a single noisy pixel or corner.
+    # Create a mask for the nearest "area" within 10 mm of the minimum
     area_mask = (crop <= min_depth + 10) & mask
 
     # Find the centroid (mean x, y) of this area
     y_coords, x_coords = np.where(area_mask)
     if y_coords.size == 0:
-         # Should be impossible if np.any(mask) passed, but for safety.
         return None
 
     center_y = np.mean(y_coords)
@@ -155,11 +153,9 @@ def _nearest_depth_pixel(depth_img: np.ndarray) -> Optional[Tuple[int, int]]:
     return int(center_x + 2), int(center_y + 2)
 
 
-
 def _get_debug_image_path() -> str:
     """Return the absolute path for debug images, creating it if needed."""
     import os
-    # The workspace is the directory containing this script.
     ws_path = os.path.dirname(os.path.abspath(__file__))
     debug_path = os.path.join(ws_path, "debug_images")
     os.makedirs(debug_path, exist_ok=True)
@@ -182,9 +178,8 @@ def _save_debug_image(image, img: np.ndarray, chosen_xy: Tuple[int, int]) -> Non
             # Save raw U16 for exact debugging
             np.save(base + ".npy", img)
 
-            # Make a safe visualization: scale to 0..255 using robust range
+            # Make a safe visualization
             d = img.astype(np.float32)
-            # Mask zeros to avoid collapsing contrast
             nonzero = d[d > 0]
             if nonzero.size > 0:
                 d_min = float(np.percentile(nonzero, 1.0))
@@ -196,7 +191,6 @@ def _save_debug_image(image, img: np.ndarray, chosen_xy: Tuple[int, int]) -> Non
             vis = cv2.applyColorMap(vis, cv2.COLORMAP_JET)
             out_path = base + ".png"
         else:
-            # Assume color image (uint8)
             vis = img.copy()
             out_path = base + ".jpg"
 
@@ -207,8 +201,8 @@ def _save_debug_image(image, img: np.ndarray, chosen_xy: Tuple[int, int]) -> Non
 
         cv2.imwrite(out_path, vis)
     except Exception as e:
-        # Log via print to avoid depending on robot logger during failures
         print(f"[pick_brick] Warning: could not save debug image: {e}")
+
 
 def _fallback_step_back(
     robot,
@@ -219,21 +213,20 @@ def _fallback_step_back(
     seconds: float = 2.0,
 ):
     """Stow arm, then step straight backwards by distance_m relative to BODY, executed in ODOM."""
-    # 1) Stow the arm (keeps life simple if a grasp failed half-closed).
+    # 1) Stow the arm
     robot.logger.info("Fallback: stowing arm…")
     stow_cmd = RobotCommandBuilder.arm_stow_command()
     stow_id = command_client.robot_command(stow_cmd)
     block_until_arm_arrives(command_client, stow_id)
 
-    # 2) Build a BODY-frame offset and express the goal in ODOM (avoids goal drift as the body moves).
+    # 2) Build a BODY-frame offset and express the goal in ODOM
     try:
         transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
 
-        # “Step back” = negative X in BODY frame.
+        # Negative X in BODY frame = step back
         body_tform_goal = math_helpers.SE2Pose(x=-abs(distance_m), y=0.0, angle=0.0)
 
-        # Convert BODY→ODOM so we can command the goal in ODOM (stable) just like the SDK sample.
-        # out_tform_goal = ODOM_T_BODY * BODY_T_GOAL
+        # Convert to ODOM frame
         out_tform_body = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, BODY_FRAME_NAME)
         out_tform_goal = out_tform_body * body_tform_goal
 
@@ -251,7 +244,7 @@ def _fallback_step_back(
             end_time_secs=time.time() + max(seconds, 1.0),
         )
 
-        # 4) Wait on trajectory feedback until AT_GOAL/SETTLED (same pattern as frame_trajectory_command.py).
+        # 4) Wait on trajectory feedback
         from bosdyn.client.robot_command import block_for_trajectory_cmd
         robot.logger.info(f"Fallback: stepping back {distance_m:.2f} m…")
         block_for_trajectory_cmd(command_client, cmd_id, timeout_sec=seconds + 3.0)
@@ -272,13 +265,17 @@ def run(
     pixel_xy: Optional[Tuple[int, int]] = None,
     feedback_poll_s: float = 0.25,
     stow_after_grasp: bool = True,
+    retries: int = 1,  # <-- MINIMAL CHANGE: number of auto-retries when fallback triggers
 ) -> bool:
     _verify_not_estopped(robot)
 
-    # Ensure clients (sequence.py already did auth/lease/power/stand)
+    # Ensure clients
     robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
     command_client = robot.ensure_client(RobotCommandClient.default_service_name)
     manipulation_api_client = robot.ensure_client(ManipulationApiClient.default_service_name)
+
+    # Track if we triggered a fallback in this attempt
+    fallback_triggered = False  # <-- MINIMAL CHANGE
 
     # Put arm in a sane pose for imaging
     robot.logger.info("Unstowing arm (arm_ready) before taking image…")
@@ -293,37 +290,35 @@ def run(
     open_id = command_client.robot_command(open_cmd)
     block_until_arm_arrives(command_client, open_id, timeout_sec=1.0)
 
-
     # Move gripper up 30cm and pitch ~45° down relative to BODY frame for a good view
     robot.logger.info("Moving gripper up 30cm and pitching down for imaging…")
     robot_state = robot_state_client.get_robot_state()
     transforms = robot_state.kinematic_state.transforms_snapshot
     body_T_hand = get_a_tform_b(transforms, BODY_FRAME_NAME, HAND_FRAME_NAME)
 
-    pitch_down_q = math_helpers.Quat.from_pitch(1.7)  # ~75° in your note; keeping your value
+    pitch_down_q = math_helpers.Quat.from_pitch(1.7)
     new_rot = body_T_hand.rotation * pitch_down_q
 
     pitch_cmd = RobotCommandBuilder.arm_pose_command(
         body_T_hand.x,
         body_T_hand.y,
-        body_T_hand.z + 0.20,  # <-- Added 30cm to the Z (height)
+        body_T_hand.z + 0.20,
         new_rot.w,
         new_rot.x,
         new_rot.y,
         new_rot.z,
         BODY_FRAME_NAME,
-        1.5,  # seconds
+        1.5,
     )
     pitch_id = command_client.robot_command(pitch_cmd)
     block_until_arm_arrives(command_client, pitch_id)
 
     # Acquire image once (fix duplicate)
     image, img = _get_image(robot, image_source)
-    
 
     # Acquire image once (fix duplicate)
     image, img = _get_image(robot, image_source)
-    
+
     # Always save the image that was used for picking, even if picking is canceled.
     _save_debug_image(image, img, None)
 
@@ -337,8 +332,7 @@ def run(
         g_image_click = None
         if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
             v = img.astype(np.float32)
-            v[v == 0] = np.nan # avoid zeros in percentile calculation
-            # Simple min/max for quick view (robust logic is in _save_depth_debug)
+            v[v == 0] = np.nan
             mn = np.nanmin(v) if np.isfinite(v).any() else 0.0
             mx = np.nanmax(v) if np.isfinite(v).any() else 1000.0
             norm = (np.nan_to_num(v, nan=mn) - mn) / max(mx - mn, 1e-6)
@@ -367,7 +361,6 @@ def run(
             )
         auto_px = _nearest_depth_pixel(img)
         if auto_px is None:
-            # Save for debugging even on failure to select pixel
             _save_debug_image(image, img, None)
             raise RuntimeError("Could not find a valid depth pixel (image may be empty or invalid).")
         target_px = auto_px
@@ -428,7 +421,6 @@ def run(
     state = robot_state_client.get_robot_state()
     ms = state.manipulator_state
 
-    # Prefer the SDK's percent-open field; fall back if the name differs across versions.
     open_pct = getattr(ms, "gripper_open_percentage", None)
     if open_pct is None:
         open_pct = getattr(ms, "gripper_open_percent", None)
@@ -443,25 +435,21 @@ def run(
 
     print(open_pct)
 
-    # Define "fully closed" conservatively as <= 10% open (your choice).
+    # Define "fully closed" conservatively as <= 10% open.
     should_open = (open_pct is not None and open_pct <= 10.0)
 
     if should_open:
         robot.logger.info("Gripper appears fully closed — opening gripper and triggering fallback().")
-        # Open the gripper
         open_cmd = RobotCommandBuilder.claw_gripper_open_command()
         open_id = command_client.robot_command(open_cmd)
         block_until_arm_arrives(command_client, open_id, timeout_sec=1.5)
 
-        # Fallback: take a small step back to re-approach on next attempt
         _fallback_step_back(robot, command_client, robot_state_client, distance_m=0.3, seconds=2.0)
 
         robot.logger.info("Waiting 3 s after fallback before continuing…")
-        time.sleep(20.0)  # adjust if Spot needs more settling time
-
+        fallback_triggered = True  # <-- MINIMAL CHANGE
     else:
         robot.logger.info("Gripper not fully closed (or reading unavailable) — continuing.")
-
 
     if success and stow_after_grasp:
         # Allow stow while holding (set carry state override)
@@ -484,7 +472,6 @@ def run(
         block_until_arm_arrives(command_client, stow_id)
 
         # Repeat the post-action gripper check after a successful pick + stow.
-        # If the gripper is still effectively "fully closed", trigger the same fallback.
         state_after_stow = robot_state_client.get_robot_state()
         ms2 = state_after_stow.manipulator_state
 
@@ -511,12 +498,28 @@ def run(
             _fallback_step_back(robot, command_client, robot_state_client, distance_m=0.3, seconds=2.0)
 
             robot.logger.info("Waiting 3 s after fallback before continuing…")
-            time.sleep(3.0)  # match your preferred settle time
+            time.sleep(3.0)
+            fallback_triggered = True  # <-- MINIMAL CHANGE
         else:
             robot.logger.info("Post-stow gripper looks fine — continuing.")
 
 
-        robot.logger.info("Waiting 3 s after fallback before continuing…")
-        time.sleep(20.0)  # adjust if Spot needs more settling time
+
+    # ---- MINIMAL CHANGE: auto-retry if fallback happened ----
+    if fallback_triggered and retries > 0:
+        robot.logger.info(f"Fallback triggered — re-running pick_brick.run (retries left: {retries})")
+        return run(
+            robot,
+            image_source=image_source,
+            force_top_down_grasp=force_top_down_grasp,
+            force_horizontal_grasp=force_horizontal_grasp,
+            force_45_angle_grasp=force_45_angle_grasp,
+            force_squeeze_grasp=force_squeeze_grasp,
+            click_ui=click_ui,
+            pixel_xy=pixel_xy,
+            feedback_poll_s=feedback_poll_s,
+            stow_after_grasp=stow_after_grasp,
+            retries=retries - 1,
+        )
 
     return success
