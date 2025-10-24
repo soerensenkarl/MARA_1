@@ -483,6 +483,39 @@ def run(
         stow_id = command_client.robot_command(stow_cmd)
         block_until_arm_arrives(command_client, stow_id)
 
+        # Repeat the post-action gripper check after a successful pick + stow.
+        # If the gripper is still effectively "fully closed", trigger the same fallback.
+        state_after_stow = robot_state_client.get_robot_state()
+        ms2 = state_after_stow.manipulator_state
+
+        open_pct2 = getattr(ms2, "gripper_open_percentage", None)
+        if open_pct2 is None:
+            open_pct2 = getattr(ms2, "gripper_open_percent", None)
+
+        holding2 = bool(getattr(ms2, "is_gripper_holding_item", False))
+
+        robot.logger.info(
+            "Post-stow gripper status — open%%: %s, holding: %s",
+            f"{open_pct2:.1f}" if open_pct2 is not None else "n/a",
+            holding2,
+        )
+
+        should_open2 = (open_pct2 is not None and open_pct2 <= 10.0)
+
+        if should_open2:
+            robot.logger.info("Post-stow: gripper still fully closed — opening and triggering fallback().")
+            open_cmd2 = RobotCommandBuilder.claw_gripper_open_command()
+            open_id2 = command_client.robot_command(open_cmd2)
+            block_until_arm_arrives(command_client, open_id2, timeout_sec=1.5)
+
+            _fallback_step_back(robot, command_client, robot_state_client, distance_m=0.3, seconds=2.0)
+
+            robot.logger.info("Waiting 3 s after fallback before continuing…")
+            time.sleep(3.0)  # match your preferred settle time
+        else:
+            robot.logger.info("Post-stow gripper looks fine — continuing.")
+
+
         robot.logger.info("Waiting 3 s after fallback before continuing…")
         time.sleep(20.0)  # adjust if Spot needs more settling time
 
