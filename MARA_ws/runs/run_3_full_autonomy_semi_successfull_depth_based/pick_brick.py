@@ -369,37 +369,6 @@ def run(
     success = fb.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED
     robot.logger.info("Finished grasp: %s", "SUCCESS" if success else "FAILED")
 
-    # -- Check gripper state and open only if it's fully closed AND not holding an item --
-    state = robot_state_client.get_robot_state()
-    ms = state.manipulator_state
-
-    # Prefer the SDK's percent-open field; fall back if the name differs across versions.
-    open_pct = getattr(ms, "gripper_open_percentage", None)
-    if open_pct is None:
-        open_pct = getattr(ms, "gripper_open_percent", None)
-
-    holding = bool(getattr(ms, "is_gripper_holding_item", False))
-
-    robot.logger.info(
-        "Gripper status — open%%: %s, holding: %s",
-        f"{open_pct:.1f}" if open_pct is not None else "n/a",
-        holding,
-    )
-
-    print(open_pct)
-
-    # Define "fully closed" conservatively as <= 1% open.
-    should_open = (open_pct <= 10.0)
-
-    if should_open:
-        robot.logger.info("Gripper is fully closed and not holding anything — opening gripper.")
-        open_cmd = RobotCommandBuilder.claw_gripper_open_command()
-        open_id = command_client.robot_command(open_cmd)
-        block_until_arm_arrives(command_client, open_id, timeout_sec=1.5)
-    else:
-        robot.logger.info("Gripper not fully closed or holding something — continuing.")
-
-
     if success and stow_after_grasp:
         # Allow stow while holding (set carry state override)
         override = manipulation_api_pb2.ApiGraspOverrideRequest(
