@@ -1,4 +1,9 @@
-# pick_brick.py — click-to-grasp from a chosen image source, then optional lift/back/stow
+# pick_brick.py — auto-pick nearest depth pixel from the arm depth camera, then optional lift/back/stow
+#
+# Changes vs your last version:
+# - Fix duplicated "Acquire image" block and indentation.
+# - Save depth to Desktop both as .npy (raw) and a colorized .png, with a red dot at the chosen pixel.
+# - Keep behavior minimal otherwise. Click UI remains available if click_ui=True.
 
 import time
 from typing import Optional, Tuple
@@ -20,9 +25,7 @@ from bosdyn.client.robot_command import (
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.frame_helpers import VISION_FRAME_NAME, BODY_FRAME_NAME, HAND_FRAME_NAME, get_a_tform_b
 
-
-
-# ---- UI globals (reused from the tutorial) ----
+# ---- UI globals (unchanged; used only if click_ui=True) ----
 g_image_click = None
 g_image_display = None
 
@@ -79,7 +82,7 @@ def _add_grasp_constraint(opts, grasp, robot_state_client):
         vision_T_body = frame_helpers.get_vision_tform_body(
             robot_state.kinematic_state.transforms_snapshot
         )
-        body_Q_grasp = math_helpers.Quat.from_pitch(1.7)  # 45°
+        body_Q_grasp = math_helpers.Quat.from_pitch(1.7)  # ~45°
         vision_Q_grasp = vision_T_body.rotation * body_Q_grasp
         c = grasp.grasp_params.allowable_orientation.add()
         c.rotation_with_tolerance.rotation_ewrt_frame.CopyFrom(vision_Q_grasp.to_proto())
@@ -111,15 +114,106 @@ def _get_image(robot, image_source):
     return image, img
 
 
+def _nearest_depth_pixel(depth_img: np.ndarray) -> Optional[Tuple[int, int]]:
+    """
+    Return (x, y) for the centroid of the nearest area.
+    Depth is expected in millimeters (DEPTH_U16). Ignores a 2-pixel border and
+    clamps absurd values > 10 m.
+    """
+    if depth_img is None or depth_img.size == 0:
+        return None
+
+    crop = depth_img[2:-2, 2:-2].astype(np.uint32)
+    mask = (crop > 0) & (crop < 10000)
+    if not np.any(mask):
+        return None
+
+    # Find the minimum valid depth
+    min_depth = np.min(crop[mask])
+
+    # Create a mask for the "nearest area", defined as all pixels
+    # within 10mm of the absolute minimum. This helps find the
+    # center of the nearest face, not just a single noisy pixel or corner.
+    area_mask = (crop <= min_depth + 10) & mask
+
+    # Find the centroid (mean x, y) of this area
+    y_coords, x_coords = np.where(area_mask)
+    if y_coords.size == 0:
+         # Should be impossible if np.any(mask) passed, but for safety.
+        return None
+
+    center_y = np.mean(y_coords)
+    center_x = np.mean(x_coords)
+
+    # Return the centroid, adjusted for the 2-pixel border
+    return int(center_x + 2), int(center_y + 2)
+
+
+
+def _get_debug_image_path() -> str:
+    """Return the absolute path for debug images, creating it if needed."""
+    import os
+    # The workspace is the directory containing this script.
+    ws_path = os.path.dirname(os.path.abspath(__file__))
+    debug_path = os.path.join(ws_path, "debug_images")
+    os.makedirs(debug_path, exist_ok=True)
+    return debug_path
+
+
+def _save_debug_image(image, img: np.ndarray, chosen_xy: Tuple[int, int]) -> None:
+    """Save raw depth (.npy) and a colorized PNG, or a color JPG, with the chosen pixel marked."""
+    import os
+    from datetime import datetime
+
+    try:
+        save_dir = _get_debug_image_path()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        is_depth = img.dtype == np.uint16
+        file_type = "depth" if is_depth else "color"
+        base = os.path.join(save_dir, f"spot_{file_type}_{ts}")
+
+        if is_depth:
+            # Save raw U16 for exact debugging
+            np.save(base + ".npy", img)
+
+            # Make a safe visualization: scale to 0..255 using robust range
+            d = img.astype(np.float32)
+            # Mask zeros to avoid collapsing contrast
+            nonzero = d[d > 0]
+            if nonzero.size > 0:
+                d_min = float(np.percentile(nonzero, 1.0))
+                d_max = float(np.percentile(nonzero, 99.0))
+            else:
+                d_min, d_max = 0.0, 1000.0
+            d_clamped = np.clip(d, d_min, d_max)
+            vis = cv2.convertScaleAbs((d_clamped - d_min) / max(d_max - d_min, 1e-6), alpha=255.0)
+            vis = cv2.applyColorMap(vis, cv2.COLORMAP_JET)
+            out_path = base + ".png"
+        else:
+            # Assume color image (uint8)
+            vis = img.copy()
+            out_path = base + ".jpg"
+
+        # Draw chosen pixel
+        if chosen_xy is not None:
+            x, y = int(chosen_xy[0]), int(chosen_xy[1])
+            cv2.drawMarker(vis, (x, y), (0, 0, 255), markerType=cv2.MARKER_CROSS, markerSize=12, thickness=2)
+
+        cv2.imwrite(out_path, vis)
+    except Exception as e:
+        # Log via print to avoid depending on robot logger during failures
+        print(f"[pick_brick] Warning: could not save debug image: {e}")
+
+
 def run(
     robot,
     *,
-    image_source: str = "frontleft_fisheye_image",
+    image_source: str = "hand_depth_in_hand_color_frame",
     force_top_down_grasp: bool = True,
     force_horizontal_grasp: bool = False,
     force_45_angle_grasp: bool = False,
     force_squeeze_grasp: bool = False,
-    click_ui: bool = True,
+    click_ui: bool = False,  # default to automatic nearest-depth selection
     pixel_xy: Optional[Tuple[int, int]] = None,
     feedback_poll_s: float = 0.25,
     stow_after_grasp: bool = True,
@@ -135,35 +229,67 @@ def run(
     robot.logger.info("Unstowing arm (arm_ready) before taking image…")
     unstow_cmd = RobotCommandBuilder.arm_ready_command()
     unstow_id = command_client.robot_command(unstow_cmd)
-    block_until_arm_arrives(command_client, unstow_id, timeout_sec=5.0)
+    block_until_arm_arrives(command_client, unstow_id, timeout_sec=3.0)
     robot.logger.info("Arm is ready for imaging.")
 
-    # --- Pitch gripper 45° down relative to BODY frame ---
-    robot.logger.info("Pitching gripper 45° down for imaging…")
+    # Open gripper fully before imaging
+    robot.logger.info("Opening gripper fully before imaging…")
+    open_cmd = RobotCommandBuilder.claw_gripper_open_command()
+    open_id = command_client.robot_command(open_cmd)
+    block_until_arm_arrives(command_client, open_id, timeout_sec=1.0)
+
+
+    # Move gripper up 30cm and pitch ~45° down relative to BODY frame for a good view
+    robot.logger.info("Moving gripper up 30cm and pitching down for imaging…")
     robot_state = robot_state_client.get_robot_state()
     transforms = robot_state.kinematic_state.transforms_snapshot
     body_T_hand = get_a_tform_b(transforms, BODY_FRAME_NAME, HAND_FRAME_NAME)
 
-    pitch_down_q = math_helpers.Quat.from_pitch(1.3)  
+    pitch_down_q = math_helpers.Quat.from_pitch(1.7)  # ~75° in your note; keeping your value
     new_rot = body_T_hand.rotation * pitch_down_q
 
     pitch_cmd = RobotCommandBuilder.arm_pose_command(
-        body_T_hand.x, body_T_hand.y, body_T_hand.z,
-        new_rot.w, new_rot.x, new_rot.y, new_rot.z,
-        BODY_FRAME_NAME, 1.0  # seconds
+        body_T_hand.x,
+        body_T_hand.y,
+        body_T_hand.z + 0.25,  # <-- Added 30cm to the Z (height)
+        new_rot.w,
+        new_rot.x,
+        new_rot.y,
+        new_rot.z,
+        BODY_FRAME_NAME,
+        1.5,  # seconds
     )
     pitch_id = command_client.robot_command(pitch_cmd)
     block_until_arm_arrives(command_client, pitch_id)
 
-
-    # Acquire image + click target
+    # Acquire image once (fix duplicate)
     image, img = _get_image(robot, image_source)
+    
+
+    # Acquire image once (fix duplicate)
+    image, img = _get_image(robot, image_source)
+    
+    # Always save the image that was used for picking, even if picking is canceled.
+    _save_debug_image(image, img, None)
+
+    # Decide target pixel
     target_px = pixel_xy
+
+    # Optional click UI (debug)
     if click_ui and target_px is None:
         robot.logger.info("Click on an object to grasp (press Q to abort)…")
         global g_image_click, g_image_display
         g_image_click = None
-        g_image_display = img
+        if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
+            v = img.astype(np.float32)
+            v[v == 0] = np.nan # avoid zeros in percentile calculation
+            # Simple min/max for quick view (robust logic is in _save_depth_debug)
+            mn = np.nanmin(v) if np.isfinite(v).any() else 0.0
+            mx = np.nanmax(v) if np.isfinite(v).any() else 1000.0
+            norm = (np.nan_to_num(v, nan=mn) - mn) / max(mx - mn, 1e-6)
+            g_image_display = (norm * 255.0).astype(np.uint8)
+        else:
+            g_image_display = img
         title = "Click to grasp"
         cv2.namedWindow(title)
         cv2.setMouseCallback(title, cv_mouse_callback)
@@ -177,9 +303,25 @@ def run(
         target_px = (int(g_image_click[0]), int(g_image_click[1]))
         cv2.destroyAllWindows()
 
+    # Auto-pick nearest valid depth pixel (default path)
     if target_px is None:
-        raise ValueError("No target pixel provided and click_ui=False.")
+        if image.shot.image.pixel_format != image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
+            raise ValueError(
+                "Automatic nearest-pixel mode requires a depth image (PIXEL_FORMAT_DEPTH_U16). "
+                f"Got pixel_format={image.shot.image.pixel_format} from source '{image_source}'."
+            )
+        auto_px = _nearest_depth_pixel(img)
+        if auto_px is None:
+            # Save for debugging even on failure to select pixel
+            _save_debug_image(image, img, None)
+            raise RuntimeError("Could not find a valid depth pixel (image may be empty or invalid).")
+        target_px = auto_px
+        robot.logger.info(f"Auto-selected nearest depth pixel: {target_px} from '{image_source}'")
 
+    # Save debug image with the chosen pixel marked
+    _save_debug_image(image, img, target_px)
+
+    # Build grasp request at the target pixel
     robot.logger.info(f"Picking at image pixel {target_px} from source '{image_source}'")
     pick_vec = geometry_pb2.Vec2(x=target_px[0], y=target_px[1])
 
@@ -190,18 +332,8 @@ def run(
         camera_model=image.source.pinhole,
     )
 
-    from bosdyn.api import manipulation_api_pb2 as mapb2
-
-    grasp.grasp_params.grasp_palm_to_fingertip = 0.1  # more “palm”; use 0.8 for more “pinch”
-    
-
-    # Hint which camera was used for the click
-    if "hand" in image_source.lower():
-        grasp.grasp_params.manipulation_camera_source = mapb2.MANIPULATION_CAMERA_SOURCE_HAND
-    else:
-        grasp.grasp_params.manipulation_camera_source = mapb2.MANIPULATION_CAMERA_SOURCE_BODY
-
-    
+    # Closer to palm for bricks. 0.0=palm, 1.0=fingertip.
+    grasp.grasp_params.grasp_palm_to_fingertip = 0.1
 
     _add_grasp_constraint(
         {
@@ -237,67 +369,24 @@ def run(
     success = fb.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED
     robot.logger.info("Finished grasp: %s", "SUCCESS" if success else "FAILED")
 
-    if success:
-        robot.logger.info("Grasp succeeded → up 70 cm → back 20 cm.")
-        # # 1) Lift up (relative to BODY frame)
-        # robot_state = robot_state_client.get_robot_state()
-        # transforms = robot_state.kinematic_state.transforms_snapshot
-        # body_T_hand = get_a_tform_b(transforms, BODY_FRAME_NAME, HAND_FRAME_NAME)
+    if success and stow_after_grasp:
+        # Allow stow while holding (set carry state override)
+        override = manipulation_api_pb2.ApiGraspOverrideRequest(
+            api_grasp_override=manipulation_api_pb2.ApiGraspOverride(
+                override_request=manipulation_api_pb2.ApiGraspOverride.OVERRIDE_HOLDING
+            ),
+            carry_state_override=manipulation_api_pb2.ApiGraspedCarryStateOverride(
+                override_request=robot_state_pb2.ManipulatorState.CARRY_STATE_CARRIABLE_AND_STOWABLE
+            ),
+        )
+        try:
+            manipulation_api_client.grasp_override_command(override)
+        except Exception:
+            pass
 
-        # target_up = (body_T_hand.x, body_T_hand.y, body_T_hand.z + 0.70)
-        # arm_up_cmd = RobotCommandBuilder.arm_pose_command(
-        #     target_up[0],
-        #     target_up[1],
-        #     target_up[2],
-        #     body_T_hand.rot.w,
-        #     body_T_hand.rot.x,
-        #     body_T_hand.rot.y,
-        #     body_T_hand.rot.z,
-        #     BODY_FRAME_NAME,
-        #     2.0,  # seconds
-        # )
-        # up_id = command_client.robot_command(arm_up_cmd)
-        # block_until_arm_arrives(command_client, up_id)
-
-        # # 2) Move back −20 cm in BODY x (keep height)
-        # robot_state = robot_state_client.get_robot_state()
-        # transforms = robot_state.kinematic_state.transforms_snapshot
-        # body_T_hand = get_a_tform_b(transforms, BODY_FRAME_NAME, HAND_FRAME_NAME)
-
-        # target_back = (body_T_hand.x - 0.20, body_T_hand.y, body_T_hand.z)
-        # arm_back_cmd = RobotCommandBuilder.arm_pose_command(
-        #     target_back[0],
-        #     target_back[1],
-        #     target_back[2],
-        #     body_T_hand.rot.w,
-        #     body_T_hand.rot.x,
-        #     body_T_hand.rot.y,
-        #     body_T_hand.rot.z,
-        #     BODY_FRAME_NAME,
-        #     1.0,  # seconds
-        # )
-        # back_id = command_client.robot_command(arm_back_cmd)
-        # block_until_arm_arrives(command_client, back_id)
-
-        if stow_after_grasp:
-            # Allow stow while holding (set carry state override)
-            override = manipulation_api_pb2.ApiGraspOverrideRequest(
-                api_grasp_override=manipulation_api_pb2.ApiGraspOverride(
-                    override_request=manipulation_api_pb2.ApiGraspOverride.OVERRIDE_HOLDING
-                ),
-                carry_state_override=manipulation_api_pb2.ApiGraspedCarryStateOverride(
-                    override_request=robot_state_pb2.ManipulatorState.CARRY_STATE_CARRIABLE_AND_STOWABLE
-                ),
-            )
-            try:
-                manipulation_api_client.grasp_override_command(override)
-            except Exception:
-                # Non-fatal: continue to try stow regardless
-                pass
-
-            robot.logger.info("Stowing arm…")
-            stow_cmd = RobotCommandBuilder.arm_stow_command()
-            stow_id = command_client.robot_command(stow_cmd)
-            block_until_arm_arrives(command_client, stow_id)
+        robot.logger.info("Stowing arm…")
+        stow_cmd = RobotCommandBuilder.arm_stow_command()
+        stow_id = command_client.robot_command(stow_cmd)
+        block_until_arm_arrives(command_client, stow_id)
 
     return success

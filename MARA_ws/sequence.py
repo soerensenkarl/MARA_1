@@ -71,14 +71,14 @@ def main():
         for i, brick in enumerate(brick_positions):
             robot.logger.info(f"Starting sequence for brick {i+1}/{len(brick_positions)}")
 
-            # 1. Pick brick
+           # Explicit, but still auto-nearest (no UI)
             pick_ok = pick.run(
                 robot,
-                image_source="hand_color_image",
-                force_top_down_grasp=True,
-                click_ui=True,
-                pixel_xy=None,
+                image_source="hand_depth_in_hand_color_frame",  # must be a DEPTH_U16 source
+                click_ui=False,                                 # auto-pick nearest
+                force_top_down_grasp=True
             )
+
             assert pick_ok, "Pick (hand camera) failed."
 
             # 2. Autowalk to the wall
