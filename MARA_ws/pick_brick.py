@@ -251,7 +251,7 @@ def run(
     pitch_cmd = RobotCommandBuilder.arm_pose_command(
         body_T_hand.x,
         body_T_hand.y,
-        body_T_hand.z + 0.25,  # <-- Added 30cm to the Z (height)
+        body_T_hand.z + 0.20,  # <-- Added 30cm to the Z (height)
         new_rot.w,
         new_rot.x,
         new_rot.y,
@@ -333,7 +333,7 @@ def run(
     )
 
     # Closer to palm for bricks. 0.0=palm, 1.0=fingertip.
-    grasp.grasp_params.grasp_palm_to_fingertip = 0.1
+    grasp.grasp_params.grasp_palm_to_fingertip = 0.2
 
     _add_grasp_constraint(
         {

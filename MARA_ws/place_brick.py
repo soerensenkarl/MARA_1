@@ -87,8 +87,8 @@ def lay_brick(x: float, y: float, z: float):
 
         # place brick
         move(x, y, z + 0.30, time=1),
-        move(x, y, z + 0.055),
-        move(x, y, z + 0.055, grip='open', time=0.0),                       # down (default time)
+        move(x, y, z + 0.053),
+        move(x, y, z + 0.053, grip='open', time=0.0),                       # down (default time)
         move(x - 0.02, y, z + 0.06, time = 0.5),
         move(x, y, 0.3, time=0.5),
     ]
