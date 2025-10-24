@@ -10,6 +10,8 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
+import math
+from bosdyn.client.frame_helpers import ODOM_FRAME_NAME, get_odom_tform_body
 
 import bosdyn.client
 from bosdyn.api import estop_pb2, geometry_pb2, image_pb2, manipulation_api_pb2, robot_state_pb2
@@ -24,6 +26,10 @@ from bosdyn.client.robot_command import (
 )
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.frame_helpers import VISION_FRAME_NAME, BODY_FRAME_NAME, HAND_FRAME_NAME, get_a_tform_b
+from bosdyn.client.frame_helpers import ODOM_FRAME_NAME, get_odom_tform_body
+from bosdyn.client.frame_helpers import get_se2_a_tform_b
+
+
 
 # ---- UI globals (unchanged; used only if click_ui=True) ----
 g_image_click = None
@@ -203,6 +209,55 @@ def _save_debug_image(image, img: np.ndarray, chosen_xy: Tuple[int, int]) -> Non
     except Exception as e:
         # Log via print to avoid depending on robot logger during failures
         print(f"[pick_brick] Warning: could not save debug image: {e}")
+
+def _fallback_step_back(
+    robot,
+    command_client,
+    robot_state_client,
+    *,
+    distance_m: float = 0.2,
+    seconds: float = 2.0,
+):
+    """Stow arm, then step straight backwards by distance_m relative to BODY, executed in ODOM."""
+    # 1) Stow the arm (keeps life simple if a grasp failed half-closed).
+    robot.logger.info("Fallback: stowing arm…")
+    stow_cmd = RobotCommandBuilder.arm_stow_command()
+    stow_id = command_client.robot_command(stow_cmd)
+    block_until_arm_arrives(command_client, stow_id)
+
+    # 2) Build a BODY-frame offset and express the goal in ODOM (avoids goal drift as the body moves).
+    try:
+        transforms = robot_state_client.get_robot_state().kinematic_state.transforms_snapshot
+
+        # “Step back” = negative X in BODY frame.
+        body_tform_goal = math_helpers.SE2Pose(x=-abs(distance_m), y=0.0, angle=0.0)
+
+        # Convert BODY→ODOM so we can command the goal in ODOM (stable) just like the SDK sample.
+        # out_tform_goal = ODOM_T_BODY * BODY_T_GOAL
+        out_tform_body = get_se2_a_tform_b(transforms, ODOM_FRAME_NAME, BODY_FRAME_NAME)
+        out_tform_goal = out_tform_body * body_tform_goal
+
+        # 3) Send the SE2 trajectory point with an end_time.
+        mobility_params = RobotCommandBuilder.mobility_params()
+        robot_cmd = RobotCommandBuilder.synchro_se2_trajectory_point_command(
+            goal_x=out_tform_goal.x,
+            goal_y=out_tform_goal.y,
+            goal_heading=out_tform_goal.angle,
+            frame_name=ODOM_FRAME_NAME,
+            params=mobility_params,
+        )
+        cmd_id = command_client.robot_command(
+            command=robot_cmd,
+            end_time_secs=time.time() + max(seconds, 1.0),
+        )
+
+        # 4) Wait on trajectory feedback until AT_GOAL/SETTLED (same pattern as frame_trajectory_command.py).
+        from bosdyn.client.robot_command import block_for_trajectory_cmd
+        robot.logger.info(f"Fallback: stepping back {distance_m:.2f} m…")
+        block_for_trajectory_cmd(command_client, cmd_id, timeout_sec=seconds + 3.0)
+        robot.logger.info("Fallback: step-back complete.")
+    except Exception as e:
+        print(f"Fallback step-back failed: {e}")
 
 
 def run(
@@ -388,16 +443,24 @@ def run(
 
     print(open_pct)
 
-    # Define "fully closed" conservatively as <= 1% open.
-    should_open = (open_pct <= 10.0)
+    # Define "fully closed" conservatively as <= 10% open (your choice).
+    should_open = (open_pct is not None and open_pct <= 10.0)
 
     if should_open:
-        robot.logger.info("Gripper is fully closed and not holding anything — opening gripper.")
+        robot.logger.info("Gripper appears fully closed — opening gripper and triggering fallback().")
+        # Open the gripper
         open_cmd = RobotCommandBuilder.claw_gripper_open_command()
         open_id = command_client.robot_command(open_cmd)
         block_until_arm_arrives(command_client, open_id, timeout_sec=1.5)
+
+        # Fallback: take a small step back to re-approach on next attempt
+        _fallback_step_back(robot, command_client, robot_state_client, distance_m=0.3, seconds=2.0)
+
+        robot.logger.info("Waiting 3 s after fallback before continuing…")
+        time.sleep(20.0)  # adjust if Spot needs more settling time
+
     else:
-        robot.logger.info("Gripper not fully closed or holding something — continuing.")
+        robot.logger.info("Gripper not fully closed (or reading unavailable) — continuing.")
 
 
     if success and stow_after_grasp:
@@ -419,5 +482,8 @@ def run(
         stow_cmd = RobotCommandBuilder.arm_stow_command()
         stow_id = command_client.robot_command(stow_cmd)
         block_until_arm_arrives(command_client, stow_id)
+
+        robot.logger.info("Waiting 3 s after fallback before continuing…")
+        time.sleep(20.0)  # adjust if Spot needs more settling time
 
     return success
