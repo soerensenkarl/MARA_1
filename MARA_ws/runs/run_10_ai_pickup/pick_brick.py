@@ -54,6 +54,42 @@ _input_layer = _compiled_model.input(0)
 _output_layer = _compiled_model.output(0)
 print("[OK] OpenVINO model compiled for CPU.")
 
+
+from datetime import datetime
+import csv
+
+# --- Fallback logging setup ---
+FALLBACK_DIR = HERE / "fallback_results"
+FALLBACK_DIR.mkdir(exist_ok=True)
+FALLBACK_CSV = FALLBACK_DIR / f"fallback_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+FALLBACK_HEADERS = [
+    "count_total",        # cumulative fallback count in this process
+    "event",              # always 'fallback'
+    "timestamp_iso",
+    "timestamp_unix",
+    "reason",             # 'planner_no_solution' | 'empty_after_post_pose'
+    "ai_attempt",         # AI-detect attempt index when known; else -1
+    "retries_remaining",  # retries value before decrement
+]
+# initialize CSV once
+with FALLBACK_CSV.open("w", newline="", encoding="utf-8") as _f:
+    csv.writer(_f).writerow(FALLBACK_HEADERS)
+print(f"[INFO] Fallback log -> {FALLBACK_CSV}")
+
+_FALLBACK_COUNT = 0  # module-global counter
+
+def _log_fallback(reason: str, ai_attempt: int, retries_remaining: int):
+    """Append one fallback row and increment the module-global counter."""
+    global _FALLBACK_COUNT
+    _FALLBACK_COUNT += 1
+    now = time.time()
+    iso = datetime.fromtimestamp(now).isoformat(timespec="seconds")
+    with FALLBACK_CSV.open("a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            _FALLBACK_COUNT, "fallback", iso, f"{now:.3f}", reason, ai_attempt, retries_remaining
+        ])
+
+
 def _ai_detect_pick_pixel(robot, image_source: str):
     """Capture a color image, run OpenVINO detection, return (image_proto, img_bgr, (x,y))."""
     image_client = robot.ensure_client(ImageClient.default_service_name)
@@ -305,47 +341,27 @@ def run(
     pixel_xy: Optional[Tuple[int, int]] = None,
     feedback_poll_s: float = 0.25,
     stow_after_grasp: bool = False,
-    retries: int = 5,           # <-- add this
+    retries: int = 20,
 ) -> bool:
     # --- safety / clients ---
-    def _verify_not_estopped(robot_):
-        estop_client = robot_.ensure_client(EstopClient.default_service_name)
-        status = estop_client.get_status()
-        if status.stop_level != estop_pb2.ESTOP_LEVEL_NONE:
-            level_name = estop_pb2.EstopStopLevel.Name(status.stop_level)
-            endpoints = [e.endpoint_name for e in status.endpoints]
-            raise RuntimeError(
-                f"Robot is estopped: stop_level={level_name}. "
-                f"Active endpoints: {', '.join(endpoints) or 'none'}.\n"
-                "Make sure your E-Stop is registered and in HOLD/RUNNING, then try again."
-            )
-
     _verify_not_estopped(robot)
 
     robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
     command_client = robot.ensure_client(RobotCommandClient.default_service_name)
     manipulation_api_client = robot.ensure_client(ManipulationApiClient.default_service_name)
 
-    # # --- Arm ready + open gripper ---
-    # print("[INFO] Unstowing arm (arm_ready)…")
-    # unstow_cmd = RobotCommandBuilder.arm_ready_command()
-    # unstow_id = command_client.robot_command(unstow_cmd)
-    # block_until_arm_arrives(command_client, unstow_id, timeout_sec=5.0)
-    # print("[OK] Arm ready.")
-
     print("[INFO] Opening gripper fully…")
     open_cmd = RobotCommandBuilder.claw_gripper_open_fraction_command(1.0)
     command_client.robot_command(open_cmd)
-    # time.sleep(0.7)
 
-        # --- Position wrist for imaging (neutral yaw first) ---
-    _move_hand_imaging_pose(command_client, yaw_rad=0.0, pitch_rad=1.0)
+    # --- Position wrist for imaging (neutral yaw first) ---
+    BASE_PITCH = 1.20  # rad (~69° down). We'll jitter ±~0.12 rad (~7°) on retries.
+    _move_hand_imaging_pose(command_client, yaw_rad=0.0, pitch_rad=BASE_PITCH)
     time.sleep(0.2)
 
-    # --- AI detection on color image, with random-yaw retries if nothing is found ---
-    max_attempts = 5  # total attempts incl. the initial neutral yaw pose
+    # --- AI detection on color image, with random yaw+pitch retries if nothing is found ---
+    max_attempts = 10
     attempt = 1
-
 
     while True:
         try:
@@ -355,15 +371,17 @@ def run(
         except RuntimeError as e:
             msg = str(e)
             if "No detection above confidence threshold" in msg and attempt < max_attempts:
-                yaw = random.uniform(-0.7, 0.7)  # ~±40°
-                print(f"[WARN] {msg}  -> Jitter yaw by {yaw:.2f} rad and try again.")
-                _move_hand_imaging_pose(command_client, yaw_rad=yaw, pitch_rad=1.3)
-                time.sleep(0.2)  # brief settle
+                # Jitter yaw (~±40°) and pitch (~±7°) around BASE_PITCH, clamped to a safe range.
+                yaw = random.uniform(-0.7, 0.7)
+                pitch = BASE_PITCH + random.uniform(-0.20, 0.12)
+                pitch = max(0.7, min(1.5, pitch))  # clamp to [0.9, 1.5] rad for safety
+
+                print(f"[WARN] {msg} -> Jitter yaw={yaw:.2f} rad, pitch={pitch:.2f} rad and retry.")
+                _move_hand_imaging_pose(command_client, yaw_rad=yaw, pitch_rad=pitch)
+                time.sleep(0.2)
                 attempt += 1
                 continue
             raise  # different error or maxed out attempts
-
-
 
     # --- Build grasp request at the AI-selected pixel ---
     print(f"[INFO] Sending grasp request at pixel {target_px} (source: '{image_source}')")
@@ -375,39 +393,9 @@ def run(
         frame_name_image_sensor=image.shot.frame_name_image_sensor,
         camera_model=image.source.pinhole,
     )
-
-    # Closer to palm for bricks. 0.0=palm, 1.0=fingertip.
     grasp.grasp_params.grasp_palm_to_fingertip = 0.2
 
-    # --- Constraints (kept from your pick_brick flow) ---
-    def _add_grasp_constraint(opts, grasp_, robot_state_client_):
-        use_vector = opts.get("force_top_down_grasp") or opts.get("force_horizontal_grasp")
-        grasp_.grasp_params.grasp_params_frame_name = VISION_FRAME_NAME
-        if use_vector:
-            if opts.get("force_top_down_grasp"):
-                axis_on_gripper = geometry_pb2.Vec3(x=1, y=0, z=0)
-                axis_to_align = geometry_pb2.Vec3(x=0, y=0, z=-1)
-            else:
-                axis_on_gripper = geometry_pb2.Vec3(x=0, y=1, z=0)
-                axis_to_align = geometry_pb2.Vec3(x=0, y=0, z=1)
-            c = grasp_.grasp_params.allowable_orientation.add()
-            c.vector_alignment_with_tolerance.axis_on_gripper_ewrt_gripper.CopyFrom(axis_on_gripper)
-            c.vector_alignment_with_tolerance.axis_to_align_with_ewrt_frame.CopyFrom(axis_to_align)
-            c.vector_alignment_with_tolerance.threshold_radians = 0.05
-        elif opts.get("force_45_angle_grasp"):
-            robot_state = robot_state_client_.get_robot_state()
-            vision_T_body = frame_helpers.get_vision_tform_body(
-                robot_state.kinematic_state.transforms_snapshot
-            )
-            body_Q_grasp = math_helpers.Quat.from_pitch(1.7)
-            vision_Q_grasp = vision_T_body.rotation * body_Q_grasp
-            c = grasp_.grasp_params.allowable_orientation.add()
-            c.rotation_with_tolerance.rotation_ewrt_frame.CopyFrom(vision_Q_grasp.to_proto())
-            c.rotation_with_tolerance.threshold_radians = 0.10
-        elif opts.get("force_squeeze_grasp"):
-            c = grasp_.grasp_params.allowable_orientation.add()
-            c.squeeze_grasp.SetInParent()
-
+    # --- Constraints (top-down, horizontal, 45°, squeeze) ---
     _add_grasp_constraint(
         {
             "force_top_down_grasp": force_top_down_grasp,
@@ -425,7 +413,7 @@ def run(
     # --- Feedback loop with "stuck in NO_SOLUTION" watchdog ---
     no_solution_count = 0
     started_ts = time.time()
-    fallback_triggered = False  # track if we decide to bail and retry
+    fallback_triggered = False
 
     while True:
         fb_req = manipulation_api_pb2.ManipulationApiFeedbackRequest(
@@ -437,23 +425,22 @@ def run(
         state_name = manipulation_api_pb2.ManipulationFeedbackState.Name(fb.current_state)
         print(f"Current state: {state_name}")
 
-        # Exit on explicit success/failure
         if fb.current_state in (
             manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED,
             manipulation_api_pb2.MANIP_STATE_GRASP_FAILED,
         ):
             break
 
-        # Watchdog: if planner keeps reporting NO_SOLUTION, trigger fallback
         if fb.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_PLANNING_NO_SOLUTION:
             no_solution_count += 1
-            # trip if >10 consecutive polls OR >15 s in loop
             if no_solution_count >= 10 or (time.time() - started_ts) > 15.0:
                 print("[WARN] Grasp planning stuck (NO_SOLUTION) — triggering fallback.")
+                # --- LOG FALLBACK: planner no-solution ---
+                _log_fallback("planner_no_solution", attempt, retries)
                 fallback_triggered = True
                 break
         else:
-            no_solution_count = 0  # reset if state changes
+            no_solution_count = 0
 
         time.sleep(feedback_poll_s)
 
@@ -462,7 +449,7 @@ def run(
     )
     print(f"[RESULT] Finished grasp: {'SUCCESS' if success else 'FAILED or ABORTED FOR FALLBACK'}")
 
-    # --- Stow with carry override (unchanged) ---
+    # --- Stow with carry override (optional) ---
     if success and stow_after_grasp:
         override = manipulation_api_pb2.ApiGraspOverrideRequest(
             api_grasp_override=manipulation_api_pb2.ApiGraspOverride(
@@ -477,71 +464,9 @@ def run(
         except Exception:
             pass
 
-          # --- If we detected a stuck planner, back up and retry the entire pickup ---
+    # --- If we detected a stuck planner, back up and retry the entire pickup ---
     if fallback_triggered:
         print("[FALLBACK] Opening gripper (safety) …")
-        try:
-            open_cmd = RobotCommandBuilder.claw_gripper_open_fraction_command(1.0)
-            command_client.robot_command(open_cmd)
-        except Exception:
-            pass
-
-        _fallback_step_back(robot, command_client, robot_state_client, distance_m=0.5, seconds=3.0)
-        time.sleep(0.5)
-
-        if retries > 0:
-            print(f"[FALLBACK] Re-running pick (retries left: {retries}) …")
-            return run(
-                robot,
-                image_source=image_source,
-                force_top_down_grasp=force_top_down_grasp,
-                force_horizontal_grasp=force_horizontal_grasp,
-                force_45_angle_grasp=force_45_angle_grasp,
-                force_squeeze_grasp=force_squeeze_grasp,
-                click_ui=click_ui,
-                pixel_xy=pixel_xy,
-                feedback_poll_s=feedback_poll_s,
-                stow_after_grasp=stow_after_grasp,
-                retries=retries - 1,
-            )
-        else:
-            print("[FALLBACK] No retries left — aborting pick.")
-            return False
-
-    # --- Position wrist in GRAV_ALIGNED_BODY and pitch ~45° down (post-pick pose) ---
-    x, y, z = 0.6, 0.0, 0.25  # 60 cm forward, 25 cm up relative to body (gravity aligned)
-    quat_down_45 = math_helpers.Quat.from_pitch(1.0).to_proto()  # ~45° pitch down
-    arm_pose_cmd = RobotCommandBuilder.arm_pose_command(
-        x, y, z,
-        quat_down_45.w, quat_down_45.x, quat_down_45.y, quat_down_45.z,
-        GRAV_ALIGNED_BODY_FRAME_NAME,
-        0.0
-    )
-    pose_id = command_client.robot_command(arm_pose_cmd)
-    block_until_arm_arrives(command_client, pose_id, timeout_sec=8.0)
-
-    # --- Post-pose gripper check → fallback if empty (same style as your earlier example) ---
-    try:
-        rs = robot_state_client.get_robot_state()
-        ms = rs.manipulator_state
-
-        # Try both proto field names across releases.
-        open_pct = getattr(ms, "gripper_open_percentage", None)
-        if open_pct is None:
-            open_pct = getattr(ms, "gripper_open_percent", None)
-        holding = bool(getattr(ms, "is_gripper_holding_item", False))
-
-        print(f"[CHECK] Post-pose gripper — open%: {('%.1f' % open_pct) if open_pct is not None else 'n/a'}, holding: {holding}")
-
-        # Define “empty” as: fully/mostly closed OR not holding item
-        empty_after_pose = ((open_pct is not None and open_pct <= 10.0) or (not holding))
-    except Exception as e:
-        print(f"[WARN] Could not read gripper state after pose: {e}")
-        empty_after_pose = False  # don’t trigger fallback blindly if state is unavailable
-
-    if empty_after_pose:
-        print("[FALLBACK] Gripper appears empty after post-pick pose — backing up 0.5 m and retrying.")
-        # Safety: ensure gripper is open before backing up / retrying
         try:
             command_client.robot_command(RobotCommandBuilder.claw_gripper_open_fraction_command(1.0))
         except Exception:
@@ -569,13 +494,66 @@ def run(
             print("[FALLBACK] No retries left — aborting pick.")
             return False
 
+    # --- Post-pick pose in GRAV_ALIGNED_BODY ---
+    x, y, z = 0.6, 0.0, 0.25
+    quat_down_45 = math_helpers.Quat.from_pitch(1.0).to_proto()
+    arm_pose_cmd = RobotCommandBuilder.arm_pose_command(
+        x, y, z,
+        quat_down_45.w, quat_down_45.x, quat_down_45.y, quat_down_45.z,
+        GRAV_ALIGNED_BODY_FRAME_NAME,
+        0.0
+    )
+    pose_id = command_client.robot_command(arm_pose_cmd)
+    block_until_arm_arrives(command_client, pose_id, timeout_sec=8.0)
 
-    # print("[INFO] Stowing arm…")
-    # stow_cmd = RobotCommandBuilder.arm_stow_command()
-    # stow_id = command_client.robot_command(stow_cmd)
-    # block_until_arm_arrives(command_client, stow_id)
+    # --- Post-pose gripper check → fallback if empty ---
+    try:
+        rs = robot_state_client.get_robot_state()
+        ms = rs.manipulator_state
 
+        open_pct = getattr(ms, "gripper_open_percentage", None)
+        if open_pct is None:
+            open_pct = getattr(ms, "gripper_open_percent", None)
+        holding = bool(getattr(ms, "is_gripper_holding_item", False))
 
+        print(f"[CHECK] Post-pose gripper — open%: {('%.1f' % open_pct) if open_pct is not None else 'n/a'}, holding: {holding}")
+        empty_after_pose = ((open_pct is not None and open_pct <= 10.0) or (not holding))
+    except Exception as e:
+        print(f"[WARN] Could not read gripper state after pose: {e}")
+        empty_after_pose = False
+
+    if empty_after_pose:
+        print("[FALLBACK] Gripper appears empty after post-pick pose — backing up 0.5 m and retrying.")
+        # --- LOG FALLBACK: empty after post-pick pose ---
+        _log_fallback("empty_after_post_pose", attempt, retries)
+
+        try:
+            command_client.robot_command(RobotCommandBuilder.claw_gripper_open_fraction_command(1.0))
+        except Exception:
+            pass
+
+        _fallback_step_back(robot, command_client, robot_state_client, distance_m=0.5, seconds=3.0)
+        time.sleep(0.5)
+
+        if retries > 0:
+            print(f"[FALLBACK] Re-running pick (retries left: {retries}) …")
+            return run(
+                robot,
+                image_source=image_source,
+                force_top_down_grasp=force_top_down_grasp,
+                force_horizontal_grasp=force_horizontal_grasp,
+                force_45_angle_grasp=force_45_angle_grasp,
+                force_squeeze_grasp=force_squeeze_grasp,
+                click_ui=click_ui,
+                pixel_xy=pixel_xy,
+                feedback_poll_s=feedback_poll_s,
+                stow_after_grasp=stow_after_grasp,
+                retries=retries - 1,
+            )
+        else:
+            print("[FALLBACK] No retries left — aborting pick.")
+            return False
 
     return success
+
 

@@ -1,0 +1,12 @@
+count_total,event,timestamp_iso,timestamp_unix,reason,ai_attempt,retries_remaining
+1,fallback,2025-10-29T14:22:00,1761744120.650,planner_no_solution,1,10
+2,fallback,2025-10-29T14:23:01,1761744181.964,planner_no_solution,1,10
+3,fallback,2025-10-29T14:24:06,1761744246.122,planner_no_solution,1,10
+4,fallback,2025-10-29T14:26:56,1761744416.471,empty_after_post_pose,1,10
+5,fallback,2025-10-29T14:28:51,1761744531.910,planner_no_solution,1,10
+6,fallback,2025-10-29T14:29:04,1761744544.623,empty_after_post_pose,1,9
+7,fallback,2025-10-29T14:30:02,1761744602.043,planner_no_solution,1,10
+8,fallback,2025-10-29T14:31:01,1761744661.328,planner_no_solution,1,10
+9,fallback,2025-10-29T14:32:01,1761744721.408,planner_no_solution,1,10
+10,fallback,2025-10-29T14:32:13,1761744733.812,empty_after_post_pose,1,9
+11,fallback,2025-10-29T14:32:27,1761744747.730,empty_after_post_pose,2,8

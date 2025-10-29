@@ -2,6 +2,8 @@
 import time
 from pathlib import Path
 import json
+from datetime import datetime
+import csv
 
 import bosdyn.client
 import bosdyn.client.util
@@ -16,10 +18,30 @@ import pick_brick as pick
 HOST = "192.168.80.3"
 CRED_PATH = Path(r"C:\Users\soere\OneDrive\Desktop\spot_creds.txt")  # change this if needed
 
+# ---- Logging setup ----
+RESULTS_DIR = Path(__file__).parent / "results"
+RESULTS_DIR.mkdir(exist_ok=True)
+CSV_PATH = RESULTS_DIR / f"sequence_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+CSV_HEADERS = [
+    "iteration",        # 1-based index
+    "step",             # pick | walk_to_wall | place | walk_to_source
+    "event",            # start | end
+    "timestamp_iso",    # local ISO string
+    "timestamp_unix",   # seconds since epoch
+]
+
+def log_event(csv_path: Path, iteration: int, step: str, event: str):
+    """Append one row to CSV log."""
+    now = time.time()
+    iso = datetime.fromtimestamp(now).isoformat(timespec="seconds")
+    with csv_path.open("a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([iteration, step, event, iso, f"{now:.3f}"])
+
 
 def load_credentials(path: Path):
     """Read username/password from a two-line text file."""
-    with path.open("r") as f:
+    with path.open("r", encoding="utf-8") as f:
         lines = [line.strip() for line in f.readlines() if line.strip()]
     if len(lines) < 2:
         raise ValueError(f"Credential file {path} must contain at least two lines: USER and PASS")
@@ -32,7 +54,7 @@ with WALL_FILE.open("r", encoding="utf-8") as f:
     brick_rows = json.load(f)  # expects [x, y, z] or [x, y, z, yaw_deg]
 
 if not isinstance(brick_rows, list) or not all(isinstance(p, (list, tuple)) and (3 <= len(p) <= 4) for p in brick_rows):
-    raise ValueError(f"wall.json must be a list of [x, y, z] or [x, y, z, yaw_deg] items.")
+    raise ValueError("wall.json must be a list of [x, y, z] or [x, y, z, yaw_deg] items.")
 
 # Normalize to (x,y,z,yaw_deg)
 brick_targets = []
@@ -51,6 +73,11 @@ WALK_TO_SOURCE = "to_source.walk"
 
 def main():
     USER, PASS = load_credentials(CRED_PATH)
+
+    # Start CSV with headers
+    with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(CSV_HEADERS)
+    print(f"Logging timestamps to: {CSV_PATH}")
 
     sdk = bosdyn.client.create_standard_sdk(
         "MARA_Sequence",
@@ -85,27 +112,34 @@ def main():
 
             # 1) Pick brick at source (AI-based from hand camera, no UI)
             print(f"Picking brick {i+1}/{N} at the source (AI detection via hand camera)…")
-            # Explicit, but still auto-nearest (no UI)
+            log_event(CSV_PATH, i+1, "pick", "start")
             pick_ok = pick.run(
                 robot,
                 image_source="hand_color_image",  # must be a DEPTH_U16 source
                 click_ui=False,                   # auto-pick nearest
                 force_top_down_grasp=True
             )
+            log_event(CSV_PATH, i+1, "pick", "end")
             assert pick_ok, "Pick (hand camera) failed."
 
             # 2) Autowalk to the wall
             print("Autowalk: to_wall.walk …")
+            log_event(CSV_PATH, i+1, "walk_to_wall", "start")
             walk_ok = walk.play_named(robot, WALK_TO_WALL)
+            log_event(CSV_PATH, i+1, "walk_to_wall", "end")
             assert walk_ok, "Autowalk to_wall.walk failed."
 
             # 3) Place brick at target with yaw
             print(f"Placing brick {i+1}/{N} at (x={x:.3f}, y={y:.3f}, z={z:.3f}), yaw={yaw_deg:.1f}°")
+            log_event(CSV_PATH, i+1, "place", "start")
             place_brick.run(robot, target=(x, y, z), yaw_deg=yaw_deg)
+            log_event(CSV_PATH, i+1, "place", "end")
 
             # 4) Autowalk back to the source
             print("Autowalk: to_source.walk …")
+            log_event(CSV_PATH, i+1, "walk_to_source", "start")
             walk_ok = walk.play_named(robot, WALK_TO_SOURCE)
+            log_event(CSV_PATH, i+1, "walk_to_source", "end")
             assert walk_ok, "Autowalk to_source.walk failed."
 
         # ---- Finish: safe sit + power off ----

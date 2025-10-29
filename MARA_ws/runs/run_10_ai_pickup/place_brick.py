@@ -44,6 +44,9 @@ DEFAULT_PITCH_DEG = 90.0        # End-effector pitch if not specified
 PREPLACE_X_OFFSET = -0.8        # Base walks to x-0.8 before placing
 BASE_WALK_SPEED = 0.4           # m/s, used to estimate trajectory end time
 
+BRICK_EE_Z_OFFSET = -0.015
+
+
 # ----------------------------
 # Small helpers
 # ----------------------------
@@ -57,10 +60,10 @@ def lay_brick(x: float, y: float, z: float):
     """Simple place sequence. (Slower for precision)"""
     return [
         move(x,     y, z + 0.30, time=2.0),  # Slower approach from above
-        move(x,     y, z + 0.05, time=2.0),  # Slower final approach
+        move(x,     y, z + 0.045, time=2.0),  # Slower final approach
         {"sleep": 0.5},  # Longer settle time
         "open",
-        move(x - .02, y, 0.30,     time=1.0),
+        move(x-0.02, y, 0.30,     time=1.0),
     ]
 
 def _parse_grip(grip: Optional[str]) -> Optional[float]:
@@ -273,9 +276,18 @@ def run(robot, target: Tuple[float, float, float], *, yaw_deg: float = 0.0):
         # Compose yaw (about +Z) with the requested pitch
         rot = _quat_from_yaw_pitch_deg(yaw_deg, pitch_deg)
 
-        # Desired pose relative to fiducial, then expressed in command frame
+        # Desired pose relative to fiducial with requested yaw/pitch
         offset_fid = SE3(dx, dy, dz, rot)
-        target_pose_in_cmd_frame = stable_cmd_T_fid * offset_fid
+
+        # Apply a local translation along the end-effector's own +Z by BRICK_EE_Z_OFFSET.
+        # Right-multiplying by SE3(0,0,delta) shifts in the tool frame, independent of fiducial orientation.
+        ee_local_z = SE3(0.0, 0.0, BRICK_EE_Z_OFFSET, Quat())
+
+        # Final target in the command frame
+        target_pose_in_cmd_frame = stable_cmd_T_fid * (offset_fid * ee_local_z)
+
+        print(f"   ↳ EE Z-offset applied: {BRICK_EE_Z_OFFSET:+.3f} m (along gripper +Z)")
+
 
         secs_used = step_seconds if step_seconds is not None else SECONDS_PER_STEP
         grip_label = "keep" if grip_frac is None else ("open" if grip_frac >= 0.5 else "close")

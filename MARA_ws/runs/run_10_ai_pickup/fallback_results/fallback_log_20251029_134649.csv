@@ -1,0 +1,17 @@
+count_total,event,timestamp_iso,timestamp_unix,reason,ai_attempt,retries_remaining
+1,fallback,2025-10-29T13:47:55,1761742075.117,planner_no_solution,1,10
+2,fallback,2025-10-29T13:48:58,1761742138.311,planner_no_solution,1,10
+3,fallback,2025-10-29T13:49:11,1761742151.289,empty_after_post_pose,1,9
+4,fallback,2025-10-29T13:49:20,1761742160.336,planner_no_solution,1,8
+5,fallback,2025-10-29T13:50:22,1761742222.086,planner_no_solution,1,10
+6,fallback,2025-10-29T13:50:31,1761742231.035,planner_no_solution,1,9
+7,fallback,2025-10-29T13:51:31,1761742291.335,planner_no_solution,1,10
+8,fallback,2025-10-29T13:51:43,1761742303.033,empty_after_post_pose,1,9
+9,fallback,2025-10-29T13:52:42,1761742362.481,planner_no_solution,1,10
+10,fallback,2025-10-29T13:52:53,1761742373.365,planner_no_solution,4,9
+11,fallback,2025-10-29T13:53:54,1761742434.902,planner_no_solution,1,10
+12,fallback,2025-10-29T13:54:57,1761742497.521,planner_no_solution,1,10
+13,fallback,2025-10-29T13:55:05,1761742505.017,planner_no_solution,1,9
+14,fallback,2025-10-29T13:55:15,1761742515.209,planner_no_solution,3,8
+15,fallback,2025-10-29T13:56:16,1761742576.601,planner_no_solution,1,10
+16,fallback,2025-10-29T13:56:24,1761742584.265,planner_no_solution,1,9
