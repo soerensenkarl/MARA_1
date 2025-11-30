@@ -1,0 +1,4 @@
+iteration,step,event,timestamp_iso,timestamp_unix
+1,pick,start,2025-10-28T14:12:32,1761657152.343
+1,pick,end,2025-10-28T14:12:41,1761657161.779
+1,walk_to_wall,start,2025-10-28T14:12:41,1761657161.779
